@@ -8,10 +8,11 @@ interface Params {
   verwaltungStart: number; verwaltungDecrease: number; persSteuersatz: number;
   rentenfaktor: number; lebenserwartung: number; rentenRendite: number; ertragsanteil: number;
   fondswechselAnzahl: number; fondswechselIntervall: number;
+  entnahmeDauer: number;
 }
 
 function simulate(params: Params) {
-  const { beitrag, alterHeute, rentenEintritt, renditePa, basiszins, fondskostenPa, abschlusskostenPct, verwaltungStart, verwaltungDecrease, persSteuersatz, rentenfaktor, lebenserwartung, rentenRendite, ertragsanteil, fondswechselAnzahl, fondswechselIntervall } = params;
+  const { beitrag, alterHeute, rentenEintritt, renditePa, basiszins, fondskostenPa, abschlusskostenPct, verwaltungStart, verwaltungDecrease, persSteuersatz, rentenfaktor, lebenserwartung, rentenRendite, ertragsanteil, fondswechselAnzahl, fondswechselIntervall, entnahmeDauer } = params;
   const monate = (rentenEintritt - alterHeute) * 12;
   const monthlyRate = renditePa / 12;
   const monthlyFondsCost = fondskostenPa / 12;
@@ -141,6 +142,59 @@ function simulate(params: Params) {
   const trEntnahmeSteuer = trBruttoEntnahme * trGewinnAnteil * kest;
   const trNettoEntnahmeMax = trBruttoEntnahme - trEntnahmeSteuer;
 
+  // ─── Kapitalentnahme (Fondspolice) über N Jahre mit Halbeinkünfteverfahren ───
+  // Jährliche gleichmäßige Brutto-Entnahme, Rest wächst weiter
+  // Halbeinkünfteverfahren: nur 50% des Ertragsanteils × pers. Steuersatz
+  let keKapital = fpBalance;
+  let keCostBasis = beitragsSumme;
+  const keJahre = Math.min(entnahmeDauer, lebenserwartung - rentenEintritt);
+  
+  // Annuität berechnen: gleichmäßige Brutto-Entnahme über keJahre bei rentenRendite
+  let keBruttoJahr: number;
+  if (rentenRendite > 0) {
+    keBruttoJahr = keKapital * rentenRendite / (1 - Math.pow(1 + rentenRendite, -keJahre));
+  } else {
+    keBruttoJahr = keKapital / keJahre;
+  }
+
+  const keVerlauf: {jahr:number;alter:number;kapital:number;brutto:number;steuer:number;netto:number}[] = [];
+  let keSteuerGesamt = 0;
+  let keNettoGesamt = 0;
+
+  for (let j = 1; j <= keJahre; j++) {
+    // Kapital wächst
+    keKapital = keKapital * (1 + rentenRendite);
+    
+    // Entnahme
+    const entnahme = Math.min(keBruttoJahr, keKapital);
+    const gewinnAnteil = keCostBasis < keKapital ? 1 - (keCostBasis / keKapital) : 0;
+    const ertragsAnteilEntnahme = entnahme * gewinnAnteil;
+    // Halbeinkünfteverfahren: 50% des Ertrags × persönlicher Steuersatz
+    const steuer = ertragsAnteilEntnahme * 0.5 * persSteuersatz;
+    const netto = entnahme - steuer;
+    
+    // Cost-Basis proportional reduzieren
+    const costBasisAnteil = keCostBasis / keKapital;
+    keKapital -= entnahme;
+    keCostBasis -= entnahme * costBasisAnteil;
+    keCostBasis = Math.max(0, keCostBasis);
+    
+    keSteuerGesamt += steuer;
+    keNettoGesamt += netto;
+    
+    keVerlauf.push({
+      jahr: j, alter: rentenEintritt + j,
+      kapital: Math.max(0, Math.round(keKapital)),
+      brutto: Math.round(entnahme),
+      steuer: Math.round(steuer),
+      netto: Math.round(netto),
+    });
+  }
+  
+  const keNettoMonatlich = keJahre > 0 ? Math.round(keNettoGesamt / keJahre / 12) : 0;
+  const keBruttoMonatlich = Math.round(keBruttoJahr / 12);
+  const keEffektiverSteuersatz = keNettoGesamt > 0 ? keSteuerGesamt / (keNettoGesamt + keSteuerGesamt) : 0;
+
   return {
     monate, beitragsSumme, fpBalance: Math.round(fpBalance), trBalance: Math.round(trBalance),
     fpTotalCosts: Math.round(fpTotalCosts), trVorabpauschaleGesamt: Math.round(trVorabpauschaleGesamt),
@@ -156,6 +210,12 @@ function simulate(params: Params) {
     trFondswechselSteuerGesamt: Math.round(trFondswechselSteuerGesamt),
     trSwitchEvents,
     switchYears: switchMonths.map(m => Math.round(m / 12)),
+    // Kapitalentnahme
+    keVerlauf, keNettoMonatlich, keBruttoMonatlich,
+    keSteuerGesamt: Math.round(keSteuerGesamt),
+    keNettoGesamt: Math.round(keNettoGesamt),
+    keEffektiverSteuersatz,
+    keJahre,
   };
 }
 
@@ -233,6 +293,7 @@ export default function Page() {
     verwaltungDecrease: 2.796, persSteuersatz: 0.17, rentenfaktor: 26.18,
     lebenserwartung: 88, rentenRendite: 0.02, ertragsanteil: 0.17,
     fondswechselAnzahl: 2, fondswechselIntervall: 10,
+    entnahmeDauer: 10,
   });
   const [activeTab, setActiveTab] = useState("anspar");
   const set = useCallback((key: keyof Params, val: number) => setParams(p => ({ ...p, [key]: val })), []);
@@ -296,6 +357,7 @@ export default function Page() {
                 <Slider label="Persönl. Steuersatz" value={Math.round(params.persSteuersatz * 100)} onChange={v => set("persSteuersatz", v / 100)} min={0} max={42} step={1} unit="%" />
                 <div className="mt-3"><Slider label="Rentenfaktor" value={params.rentenfaktor} onChange={v => set("rentenfaktor", v)} min={15} max={35} step={0.1} /></div>
                 <div className="mt-3"><Slider label="Lebenserwartung" value={params.lebenserwartung} onChange={v => set("lebenserwartung", v)} min={75} max={100} unit=" Jahre" /></div>
+                <div className="mt-3"><Slider label="Kapitalentnahme über" value={params.entnahmeDauer} onChange={v => set("entnahmeDauer", v)} min={5} max={25} unit=" Jahre" helpText="Für steuerbegünstigte Teilentnahme" /></div>
               </div>
               <div className="bg-zinc-800/50 rounded-lg p-3">
                 <p className="text-xs text-zinc-400"><span className="font-semibold text-zinc-300">{r.monate / 12} Jahre</span> Ansparzeit</p>
@@ -437,6 +499,82 @@ export default function Page() {
                   </div>
                 )}
               </div>
+
+              {/* ─── Kapitalentnahme (Fondspolice) ─── */}
+              <div className="bg-zinc-900/70 rounded-xl border border-violet-800/30 p-5">
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="w-8 h-8 rounded-lg bg-violet-600 flex items-center justify-center shrink-0">
+                    <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342 1.453-1.096V18.75M3.75 4.5v.75A.75.75 0 013 6h-.75m0 0v-.375c0-.621.504-1.125 1.125-1.125H20.25M2.25 6v9m18-10.5v.75c0 .414.336.75.75.75h.75m-1.5-1.5h.375c.621 0 1.125.504 1.125 1.125v9.75c0 .621-.504 1.125-1.125 1.125h-.375m1.5-1.5H21a.75.75 0 00-.75.75v.75m0 0H3.75m0 0h-.375a1.125 1.125 0 01-1.125-1.125V15m1.5 1.5v-.75A.75.75 0 003 15h-.75M15 10.5a3 3 0 11-6 0 3 3 0 016 0zm3 0h.008v.008H18V10.5zm-12 0h.008v.008H6V10.5z" /></svg>
+                  </div>
+                  <div>
+                    <h2 className="text-lg font-semibold text-zinc-100">Alternative: Kapitalentnahme</h2>
+                    <p className="text-sm text-zinc-500">Steuerbegünstigte Teilentnahme über {r.keJahre} Jahre (Halbeinkünfteverfahren)</p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-3 mb-4">
+                  <div className="bg-violet-950/30 rounded-xl border border-violet-800/20 p-3 text-center">
+                    <p className="text-xs text-violet-400/70 uppercase tracking-wider mb-1">Netto / Monat</p>
+                    <p className="text-2xl font-bold font-mono text-violet-400">{fmtEur(r.keNettoMonatlich)}</p>
+                    <p className="text-xs text-zinc-500 mt-1">über {r.keJahre} Jahre</p>
+                  </div>
+                  <div className="bg-zinc-800/50 rounded-xl border border-zinc-700/30 p-3 text-center">
+                    <p className="text-xs text-zinc-400 uppercase tracking-wider mb-1">Eff. Steuersatz</p>
+                    <p className="text-2xl font-bold font-mono text-emerald-400">{(r.keEffektiverSteuersatz * 100).toFixed(1)}%</p>
+                    <p className="text-xs text-zinc-500 mt-1">vs. {(26.375 * 0.7).toFixed(1)}% im Depot</p>
+                  </div>
+                  <div className="bg-zinc-800/50 rounded-xl border border-zinc-700/30 p-3 text-center">
+                    <p className="text-xs text-zinc-400 uppercase tracking-wider mb-1">Steuer gesamt</p>
+                    <p className="text-2xl font-bold font-mono text-zinc-200">{fmtEur(r.keSteuerGesamt)}</p>
+                    <p className="text-xs text-zinc-500 mt-1">Halbeinkünfteverfahren</p>
+                  </div>
+                </div>
+
+                <p className="text-xs text-zinc-400 mb-3">Jährliche Entnahmen – Restkapital wächst mit {Math.round(params.rentenRendite * 100)}% p.a.</p>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b border-zinc-800">
+                        <th className="py-1.5 pr-2 text-left text-zinc-500 font-medium">Jahr</th>
+                        <th className="py-1.5 pr-2 text-left text-zinc-500 font-medium">Alter</th>
+                        <th className="py-1.5 pr-2 text-right text-zinc-500 font-medium">Brutto</th>
+                        <th className="py-1.5 pr-2 text-right text-zinc-500 font-medium">Steuer</th>
+                        <th className="py-1.5 pr-2 text-right text-zinc-500 font-medium">Netto</th>
+                        <th className="py-1.5 text-right text-zinc-500 font-medium">Restkapital</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {r.keVerlauf.map((row, i) => (
+                        <tr key={i} className="border-b border-zinc-800/50">
+                          <td className="py-1.5 pr-2 text-zinc-400">{row.jahr}</td>
+                          <td className="py-1.5 pr-2 text-zinc-400">{row.alter}</td>
+                          <td className="py-1.5 pr-2 text-right font-mono text-zinc-200">{fmtEur(row.brutto)}</td>
+                          <td className="py-1.5 pr-2 text-right font-mono text-red-400">{fmtEur(row.steuer)}</td>
+                          <td className="py-1.5 pr-2 text-right font-mono text-violet-400 font-semibold">{fmtEur(row.netto)}</td>
+                          <td className="py-1.5 text-right font-mono text-zinc-400">{fmtEur(row.kapital)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr className="border-t border-zinc-700">
+                        <td colSpan={2} className="py-2 text-zinc-300 font-semibold">Summe</td>
+                        <td className="py-2 text-right font-mono text-zinc-200 font-semibold">{fmtEur(r.keVerlauf.reduce((s, r) => s + r.brutto, 0))}</td>
+                        <td className="py-2 text-right font-mono text-red-400 font-semibold">{fmtEur(r.keSteuerGesamt)}</td>
+                        <td className="py-2 text-right font-mono text-violet-400 font-semibold">{fmtEur(r.keNettoGesamt)}</td>
+                        <td className="py-2"></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+
+                <div className="mt-4 bg-violet-950/20 rounded-lg p-3 border border-violet-800/20">
+                  <p className="text-sm text-zinc-300">
+                    <span className="text-violet-400 font-semibold">Halbeinkünfteverfahren:</span> Bei Auszahlung nach dem 62. Lebensjahr und mind. 12 Jahren Vertragslaufzeit wird nur die Hälfte des Ertragsanteils mit dem persönlichen Steuersatz ({Math.round(params.persSteuersatz * 100)}%) versteuert. Effektiv zahlst du nur <span className="text-emerald-400 font-semibold">{(r.keEffektiverSteuersatz * 100).toFixed(1)}%</span> Steuern statt {(26.375 * 0.7).toFixed(1)}% KESt im Depot.
+                  </p>
+                </div>
+              </div>
+
               <div className={`rounded-xl border p-5 ${r.trReichtAlter < params.lebenserwartung ? "bg-red-950/20 border-red-800/30" : "bg-emerald-950/20 border-emerald-800/30"}`}>
                 <div className="flex items-start gap-3">
                   <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${r.trReichtAlter < params.lebenserwartung ? "bg-red-900/50" : "bg-emerald-900/50"}`}>
@@ -472,6 +610,10 @@ export default function Page() {
                       <div className="flex justify-between"><span className="text-zinc-400">Monatl. Rente (netto)</span><span className="font-mono text-emerald-400 font-semibold">{fmtEur(r.fpNettoRente)}</span></div>
                       <div className="flex justify-between"><span className="text-zinc-400">Dauer</span><span className="font-mono text-emerald-400">Lebenslang ∞</span></div>
                       {r.switchYears.length > 0 && <div className="flex justify-between"><span className="text-zinc-400">Fondswechsel-Steuer</span><span className="font-mono text-emerald-400">0 €</span></div>}
+                      <div className="pt-2 mt-2 border-t border-zinc-800">
+                        <div className="flex justify-between"><span className="text-zinc-400">Kapitalentnahme ({r.keJahre}J)</span><span className="font-mono text-violet-400 font-semibold">{fmtEur(r.keNettoMonatlich)}/M</span></div>
+                        <div className="flex justify-between"><span className="text-zinc-400">Eff. Steuersatz</span><span className="font-mono text-emerald-400">{(r.keEffektiverSteuersatz * 100).toFixed(1)}%</span></div>
+                      </div>
                     </div>
                   </div>
                   <div className="space-y-3">
@@ -496,6 +638,7 @@ export default function Page() {
                     <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Günstige Ertragsanteilsbesteuerung</li>
                     <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Kein Langlebigkeitsrisiko</li>
                     <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> <strong>Steuerfreie Fondswechsel</strong> im Mantel</li>
+                    <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> <strong>Kapitalentnahme</strong> mit Halbeinkünfteverfahren</li>
                   </ul>
                 </div>
                 <div className="bg-sky-950/20 rounded-xl border border-sky-800/20 p-5">
