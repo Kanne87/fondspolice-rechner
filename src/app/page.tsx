@@ -4,22 +4,33 @@ import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianG
 
 interface Params {
   beitrag: number; alterHeute: number; rentenEintritt: number; renditePa: number;
-  basiszins: number; fondsguthabenKosten: number; abschlussKostenPct: number;
-  verwaltungFix: number; laufendeAV: number; persSteuersatz: number;
+  basiszins: number; persSteuersatz: number;
   rentenfaktor: number; lebenserwartung: number; rentenRendite: number; ertragsanteil: number;
   fondswechselAnzahl: number; fondswechselIntervall: number;
-  entnahmeDauer: number; rentenVerwaltungPct: number;
+  entnahmeDauer: number;
 }
 
+// HanseMerkur Vario Care Invest – Kostenstruktur (abgeleitet aus PIB 75€ + 700€)
+const HM_ABSCHLUSS_PCT = 0.025;           // 2,50% der BWS
+const HM_LAUFENDE_AV_PCT = 0.0172;        // 1,72% vom Monatsbeitrag (ab Monat 61)
+const HM_VERWALTUNG_FIX = 1.01;           // 1,01€/Monat Fixanteil
+const HM_VERWALTUNG_PCT = 0.0679;         // 6,79% vom Monatsbeitrag
+const HM_FONDSGUTHABEN_PA = 0.00192;      // 0,192% p.a. (0,16€ pro 1.000€/Monat)
+const HM_RENTEN_VERWALTUNG_PCT = 0.01;    // 1€ pro 100€ Rente = 1%
+
 function simulate(params: Params) {
-  const { beitrag, alterHeute, rentenEintritt, renditePa, basiszins, fondsguthabenKosten, abschlussKostenPct, verwaltungFix, laufendeAV, persSteuersatz, rentenfaktor, lebenserwartung, rentenRendite, ertragsanteil, fondswechselAnzahl, fondswechselIntervall, entnahmeDauer, rentenVerwaltungPct } = params;
+  const { beitrag, alterHeute, rentenEintritt, renditePa, basiszins, persSteuersatz, rentenfaktor, lebenserwartung, rentenRendite, ertragsanteil, fondswechselAnzahl, fondswechselIntervall, entnahmeDauer } = params;
   const monate = (rentenEintritt - alterHeute) * 12;
   const monthlyRate = renditePa / 12;
-  const monthlyFondsCost = fondsguthabenKosten / 12;
+  const monthlyFondsCost = HM_FONDSGUTHABEN_PA / 12;
   const beitragsSumme = beitrag * monate;
-  // HanseMerkur: Abschlusskosten gezillmert auf 60 Monate
-  const abschlussGesamt = beitragsSumme * abschlussKostenPct;
+  
+  // HanseMerkur Kosten – abgeleitet vom Beitrag
+  const abschlussGesamt = beitragsSumme * HM_ABSCHLUSS_PCT;
   const abschlussMonatlich = abschlussGesamt / 60;
+  const laufendeAVmonatlich = beitrag * HM_LAUFENDE_AV_PCT;
+  const verwaltungMonatlich = HM_VERWALTUNG_FIX + beitrag * HM_VERWALTUNG_PCT;
+  
   const kest = 0.26375;
   const teilfreistellungETF = 0.30;
   const rentenMonate = (lebenserwartung - rentenEintritt) * 12;
@@ -39,12 +50,12 @@ function simulate(params: Params) {
 
   for (let m = 1; m <= monate; m++) {
     const balanceStart = fpBalance + beitrag;
-    // HanseMerkur Fondsguhabenkosten (0,16€ pro 1.000€ monatlich = ~0,192% p.a.)
+    // Fondsguthabenkosten: 0,16€ pro 1.000€ Guthaben/Monat
     const fundCost = balanceStart * monthlyFondsCost;
-    // Abschluss+Vertrieb: gezillmert auf 60 Monate, danach laufende A&V
-    const distCost = m <= 60 ? abschlussMonatlich : laufendeAV;
-    // Verwaltungskosten: fix pro Monat
-    const adminCost = verwaltungFix;
+    // Monat 1-60: Abschluss gezillmert | ab 61: laufende A&V (1,72% vom Beitrag)
+    const distCost = m <= 60 ? abschlussMonatlich : laufendeAVmonatlich;
+    // Verwaltung: 1,01€ + 6,79% × Beitrag (monatlich)
+    const adminCost = verwaltungMonatlich;
     const netForGrowth = balanceStart - fundCost - distCost - adminCost;
     const growth = netForGrowth * monthlyRate;
     fpBalance = netForGrowth + growth;
@@ -117,7 +128,7 @@ function simulate(params: Params) {
   // ─── Rente ───
   const fpMonatlicheRenteBrutto = (fpBalance / 10000) * rentenfaktor;
   // HanseMerkur: Rentenverwaltung 1€ pro 100€ Rente = 1%
-  const fpRentenVerwaltung = fpMonatlicheRenteBrutto * rentenVerwaltungPct;
+  const fpRentenVerwaltung = fpMonatlicheRenteBrutto * HM_RENTEN_VERWALTUNG_PCT;
   const fpMonatlicheRente = fpMonatlicheRenteBrutto - fpRentenVerwaltung;
   const fpErtragsanteil = fpMonatlicheRente * ertragsanteil;
   const fpRentenSteuer = fpErtragsanteil * persSteuersatz;
@@ -161,7 +172,7 @@ function simulate(params: Params) {
   
   // Annuität berechnen: gleichmäßige Brutto-Entnahme über keJahre bei keRendite
   // Berücksichtigt laufende Fondsguthabenkosten (~0,192% p.a.)
-  const keNettoRendite = keRendite - fondsguthabenKosten;
+  const keNettoRendite = keRendite - HM_FONDSGUTHABEN_PA;
   let keBruttoJahr: number;
   if (keNettoRendite > 0) {
     keBruttoJahr = keKapital * keNettoRendite / (1 - Math.pow(1 + keNettoRendite, -keJahre));
@@ -210,6 +221,11 @@ function simulate(params: Params) {
   return {
     monate, beitragsSumme, fpBalance: Math.round(fpBalance), trBalance: Math.round(trBalance),
     fpTotalCosts: Math.round(fpTotalCosts), trVorabpauschaleGesamt: Math.round(trVorabpauschaleGesamt),
+    // Cost breakdown for display
+    abschlussMonatlich: Math.round(abschlussMonatlich * 100) / 100,
+    abschlussGesamt: Math.round(abschlussGesamt),
+    verwaltungMonatlich: Math.round(verwaltungMonatlich * 100) / 100,
+    laufendeAVmonatlich: Math.round(laufendeAVmonatlich * 100) / 100,
     trNetto: Math.round(trNetto), trSteuerAufwand: Math.round(Math.max(0, trSteuerAufwand)),
     fpNettoKapital: Math.round(fpNettoKapital), fpSteuerAufwand: Math.round(fpSteuerAufwand),
     fpKapitalauszahlungskosten: Math.round(fpKapitalauszahlungskosten),
@@ -303,11 +319,10 @@ const customTooltip = ({ active, payload, label }: any) => {
 export default function Page() {
   const [params, setParams] = useState<Params>({
     beitrag: 1000, alterHeute: 38, rentenEintritt: 67, renditePa: 0.09, basiszins: 0.032,
-    fondsguthabenKosten: 0.00192, abschlussKostenPct: 0.04, verwaltungFix: 6.10,
-    laufendeAV: 1.29, persSteuersatz: 0.17, rentenfaktor: 26.18,
+    persSteuersatz: 0.17, rentenfaktor: 26.18,
     lebenserwartung: 88, rentenRendite: 0.02, ertragsanteil: 0.17,
     fondswechselAnzahl: 2, fondswechselIntervall: 10,
-    entnahmeDauer: 10, rentenVerwaltungPct: 0.01,
+    entnahmeDauer: 10,
   });
   const [activeTab, setActiveTab] = useState("anspar");
   const set = useCallback((key: keyof Params, val: number) => setParams(p => ({ ...p, [key]: val })), []);
@@ -445,7 +460,7 @@ export default function Page() {
                 <div className="bg-zinc-900/70 rounded-xl border border-emerald-800/30 p-5 space-y-3">
                   <div className="flex items-center gap-2 mb-3"><span className="w-2.5 h-2.5 rounded-full bg-emerald-500" /><h3 className="text-sm font-semibold text-emerald-400">Fondspolice / Privatrente</h3></div>
                   <MetricCard label="Endkapital (brutto)" value={fmtEur(r.fpBalance)} accent />
-                  <MetricCard label="Kosten gesamt" value={fmtEur(r.fpTotalCosts)} sub={`Abschluss (${Math.round(params.abschlussKostenPct*100)}% gezillmert) + Verwaltung ${params.verwaltungFix}€/Mo + Fonds`} />
+                  <MetricCard label="Kosten gesamt" value={fmtEur(r.fpTotalCosts)} sub={`Abschluss ${r.abschlussMonatlich}€/Mo (60 Mo) → ${r.laufendeAVmonatlich}€ | Verwaltung ${r.verwaltungMonatlich}€/Mo`} />
                   <MetricCard label="Steuer bei Auszahlung" value={fmtEur(r.fpSteuerAufwand)} sub="Halbeinkünfteverfahren (50% × pers. Satz)" />
                   <MetricCard label="Teilentnahme-Kosten" value="0 €" sub="Kein Abzug bei Entnahme (HanseMerkur)" accent />
                   {r.switchYears.length > 0 && <MetricCard label="Fondswechsel-Steuer" value="0 €" sub="Steuerfrei im Versicherungsmantel" accent />}
@@ -478,7 +493,7 @@ export default function Page() {
                     <p className="text-xs text-zinc-500 mt-1">netto / Monat – garantiert lebenslang</p>
                     <div className="mt-3 pt-3 border-t border-emerald-900/30 space-y-1">
                       <p className="text-xs text-zinc-400">Brutto: {fmtEur(r.fpMonatlicheRenteBrutto)}</p>
-                      <p className="text-xs text-zinc-400">Verwaltung: −{fmtEur(r.fpRentenVerwaltung)}/Mo ({Math.round(params.rentenVerwaltungPct * 100)}%)</p>
+                      <p className="text-xs text-zinc-400">Verwaltung: −{fmtEur(r.fpRentenVerwaltung)}/Mo (1%)</p>
                       <p className="text-xs text-zinc-400">Ertragsanteilsbesteuerung: {Math.round(params.ertragsanteil * 100)}%</p>
                       <p className="text-xs text-zinc-400">Rentenfaktor: {params.rentenfaktor}</p>
                     </div>
@@ -588,7 +603,7 @@ export default function Page() {
                     <span className="text-violet-400 font-semibold">Halbeinkünfteverfahren:</span> Bei Auszahlung nach dem 62. Lebensjahr und mind. 12 Jahren Vertragslaufzeit wird nur die Hälfte des Ertragsanteils mit dem persönlichen Steuersatz ({Math.round(params.persSteuersatz * 100)}%) versteuert. Effektiv zahlst du nur <span className="text-emerald-400 font-semibold">{(r.keEffektiverSteuersatz * 100).toFixed(1)}%</span> Steuern statt {(26.375 * 0.7).toFixed(1)}% KESt im Depot.
                   </p>
                   <p className="text-sm text-zinc-400 mt-2">
-                    <span className="text-zinc-300 font-medium">HanseMerkur Vario Care Invest:</span> Teilentnahmen ohne Abzug. Das Restkapital bleibt investiert ({Math.round(r.keRendite * 100)}% p.a.) – laufende Fondsguthabenkosten ({(params.fondsguthabenKosten * 100).toFixed(2)}% p.a.) werden weiter berechnet.
+                    <span className="text-zinc-300 font-medium">HanseMerkur Vario Care Invest:</span> Teilentnahmen ohne Abzug. Das Restkapital bleibt investiert ({Math.round(r.keRendite * 100)}% p.a.) – laufende Fondsguthabenkosten ({(HM_FONDSGUTHABEN_PA * 100).toFixed(2)}% p.a.) werden weiter berechnet.
                   </p>
                 </div>
               </div>
