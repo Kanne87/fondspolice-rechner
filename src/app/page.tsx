@@ -2,17 +2,16 @@
 import { useState, useMemo, useCallback } from "react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine } from "recharts";
 
-// ─── Types ────────────────────────────────────────────────────────
 interface Params {
   beitrag: number; alterHeute: number; rentenEintritt: number; renditePa: number;
   basiszins: number; fondskostenPa: number; abschlusskostenPct: number;
   verwaltungStart: number; verwaltungDecrease: number; persSteuersatz: number;
   rentenfaktor: number; lebenserwartung: number; rentenRendite: number; ertragsanteil: number;
+  fondswechselAnzahl: number; fondswechselIntervall: number;
 }
 
-// ─── Calculation Engine ───────────────────────────────────────────
 function simulate(params: Params) {
-  const { beitrag, alterHeute, rentenEintritt, renditePa, basiszins, fondskostenPa, abschlusskostenPct, verwaltungStart, verwaltungDecrease, persSteuersatz, rentenfaktor, lebenserwartung, rentenRendite, ertragsanteil } = params;
+  const { beitrag, alterHeute, rentenEintritt, renditePa, basiszins, fondskostenPa, abschlusskostenPct, verwaltungStart, verwaltungDecrease, persSteuersatz, rentenfaktor, lebenserwartung, rentenRendite, ertragsanteil, fondswechselAnzahl, fondswechselIntervall } = params;
   const monate = (rentenEintritt - alterHeute) * 12;
   const monthlyRate = renditePa / 12;
   const monthlyFondsCost = fondskostenPa / 12;
@@ -23,6 +22,14 @@ function simulate(params: Params) {
   const rentenMonate = (lebenserwartung - rentenEintritt) * 12;
   const rentenMonthlyRate = rentenRendite / 12;
 
+  // Build switch points (month numbers where fund switch happens)
+  const switchMonths: number[] = [];
+  for (let i = 1; i <= fondswechselAnzahl; i++) {
+    const switchMonth = i * fondswechselIntervall * 12;
+    if (switchMonth < monate) switchMonths.push(switchMonth);
+  }
+
+  // ─── Ansparphase: Fondspolice (switches have ZERO tax impact) ───
   let fpBalance = 0;
   const fpData: {monat:number;jahr:number;fpBalance:number;trBalance:number}[] = [];
   let fpTotalCosts = 0;
@@ -42,19 +49,26 @@ function simulate(params: Params) {
     }
   }
 
+  // ─── Ansparphase: Trading (switches trigger full gain realization) ───
   let trBalance = 0;
+  let trCostBasis = 0; // tracks what was "paid in" (contributions + reinvested after-tax)
   let trVorabpauschaleGesamt = 0;
   let trYearStartBalance = 0;
   let trYearContributions = 0;
+  let trFondswechselSteuerGesamt = 0;
+  const trSwitchEvents: {monat:number;jahr:number;steuer:number;gewinn:number;balanceVor:number;balanceNach:number}[] = [];
 
   for (let m = 1; m <= monate; m++) {
     if ((m - 1) % 12 === 0) { trYearStartBalance = trBalance; trYearContributions = 0; }
     trYearContributions += beitrag;
+    trCostBasis += beitrag;
     const balanceStart = trBalance + beitrag;
     const fundCost = balanceStart * monthlyFondsCost;
     const netForGrowth = balanceStart - fundCost;
     const growth = netForGrowth * monthlyRate;
     trBalance = netForGrowth + growth;
+
+    // Vorabpauschale at year end
     if (m % 12 === 0) {
       const basisertrag = trYearStartBalance * basiszins * 0.7;
       const actualGain = trBalance - trYearStartBalance - trYearContributions;
@@ -63,15 +77,29 @@ function simulate(params: Params) {
       trVorabpauschaleGesamt += vorabSteuer;
       trBalance -= vorabSteuer;
     }
+
+    // Fund switch: realize all gains, pay tax, reset cost basis
+    if (switchMonths.includes(m)) {
+      const gewinn = Math.max(0, trBalance - trCostBasis);
+      const steuerpflichtig = gewinn * (1 - teilfreistellungETF);
+      const steuer = steuerpflichtig * kest;
+      const balanceVor = trBalance;
+      trBalance -= steuer;
+      trFondswechselSteuerGesamt += steuer;
+      trCostBasis = trBalance; // reset: everything is now "paid in"
+      trSwitchEvents.push({ monat: m, jahr: Math.round(m / 12), steuer: Math.round(steuer), gewinn: Math.round(gewinn), balanceVor: Math.round(balanceVor), balanceNach: Math.round(trBalance) });
+    }
+
     if (m % 12 === 0 || m === monate) {
       const idx = fpData.findIndex(d => d.monat === m);
       if (idx >= 0) fpData[idx].trBalance = Math.round(trBalance);
     }
   }
 
-  const trGewinn = trBalance - beitragsSumme;
+  // ─── Exit taxes ───
+  const trGewinn = trBalance - trCostBasis;
   const trSteuerpflichtig = trGewinn * (1 - teilfreistellungETF);
-  const trSteuerAufwand = trSteuerpflichtig * kest - trVorabpauschaleGesamt;
+  const trSteuerAufwand = trSteuerpflichtig * kest;
   const trNetto = trBalance - Math.max(0, trSteuerAufwand);
 
   const fpGewinn = fpBalance - beitragsSumme;
@@ -80,6 +108,7 @@ function simulate(params: Params) {
   const fpSteuerAufwand = fpSteuerpflichtig * persSteuersatz;
   const fpNettoKapital = fpBalance - fpKapitalauszahlungskosten - fpSteuerAufwand;
 
+  // ─── Rente ───
   const fpMonatlicheRente = (fpBalance / 10000) * rentenfaktor;
   const fpErtragsanteil = fpMonatlicheRente * ertragsanteil;
   const fpRentenSteuer = fpErtragsanteil * persSteuersatz;
@@ -124,6 +153,9 @@ function simulate(params: Params) {
     trReichtMonate, trReichtJahre: Math.round(trReichtMonate / 12 * 10) / 10,
     trReichtAlter: rentenEintritt + Math.round(trReichtMonate / 12 * 10) / 10,
     ansparData: fpData, rentenVerlauf: trRentenVerlauf,
+    trFondswechselSteuerGesamt: Math.round(trFondswechselSteuerGesamt),
+    trSwitchEvents,
+    switchYears: switchMonths.map(m => Math.round(m / 12)),
   };
 }
 
@@ -200,6 +232,7 @@ export default function Page() {
     fondskostenPa: 0.002, abschlusskostenPct: 0.025, verwaltungStart: 123.17,
     verwaltungDecrease: 2.796, persSteuersatz: 0.17, rentenfaktor: 26.18,
     lebenserwartung: 88, rentenRendite: 0.02, ertragsanteil: 0.17,
+    fondswechselAnzahl: 2, fondswechselIntervall: 10,
   });
   const [activeTab, setActiveTab] = useState("anspar");
   const set = useCallback((key: keyof Params, val: number) => setParams(p => ({ ...p, [key]: val })), []);
@@ -234,6 +267,30 @@ export default function Page() {
               <Slider label="Renteneintritt" value={params.rentenEintritt} onChange={v => set("rentenEintritt", v)} min={60} max={70} unit=" Jahre" />
               <Slider label="Erwartete Rendite" value={Math.round(params.renditePa * 100)} onChange={v => set("renditePa", v / 100)} min={3} max={12} step={0.5} unit="% p.a." />
               <Slider label="Basiszins" value={Math.round(params.basiszins * 1000) / 10} onChange={v => set("basiszins", v / 100)} min={0} max={5} step={0.1} unit="%" helpText="Aktuell 3,2% (Stand 2025)" />
+
+              {/* Fund Switch Section */}
+              <div className="border-t border-zinc-800 pt-3">
+                <div className="flex items-center gap-2 mb-1">
+                  <svg className="w-3.5 h-3.5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
+                  <p className="text-xs text-amber-400 font-semibold">Fondswechsel / Umschichtung</p>
+                </div>
+                <p className="text-xs text-zinc-600 mb-3">Im Versicherungsmantel steuerfrei, im Depot steuerpflichtig</p>
+                <Slider label="Anzahl Fondswechsel" value={params.fondswechselAnzahl} onChange={v => set("fondswechselAnzahl", v)} min={0} max={4} unit="×" />
+                {params.fondswechselAnzahl > 0 && (
+                  <div className="mt-3">
+                    <Slider label="Alle" value={params.fondswechselIntervall} onChange={v => set("fondswechselIntervall", v)} min={3} max={15} unit=" Jahre" />
+                  </div>
+                )}
+                {params.fondswechselAnzahl > 0 && r.switchYears.length > 0 && (
+                  <div className="mt-2 bg-zinc-800/50 rounded-lg p-2">
+                    <p className="text-xs text-zinc-400">Wechsel in Jahr: <span className="text-amber-400 font-mono font-semibold">{r.switchYears.join(", ")}</span></p>
+                    {r.trFondswechselSteuerGesamt > 0 && (
+                      <p className="text-xs text-red-400 mt-1">Steuerverlust Depot: <span className="font-mono font-semibold">{fmtEur(r.trFondswechselSteuerGesamt)}</span></p>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <div className="border-t border-zinc-800 pt-3">
                 <p className="text-xs text-zinc-500 mb-3">Erweitert</p>
                 <Slider label="Persönl. Steuersatz" value={Math.round(params.persSteuersatz * 100)} onChange={v => set("persSteuersatz", v / 100)} min={0} max={42} step={1} unit="%" />
@@ -251,7 +308,7 @@ export default function Page() {
             {activeTab === "anspar" && (<>
               <div className="bg-zinc-900/70 rounded-xl border border-zinc-800/60 p-5">
                 <h2 className="text-lg font-semibold text-zinc-100 mb-1">Vermögenswachstum</h2>
-                <p className="text-sm text-zinc-500 mb-4">Kapitalentwicklung über die Ansparphase</p>
+                <p className="text-sm text-zinc-500 mb-4">Kapitalentwicklung über die Ansparphase{r.switchYears.length > 0 && ` – Fondswechsel in Jahr ${r.switchYears.join(", ")}`}</p>
                 <ResponsiveContainer width="100%" height={320}>
                   <AreaChart data={r.ansparData} margin={{ top: 10, right: 10, left: 10, bottom: 0 }}>
                     <defs>
@@ -262,6 +319,9 @@ export default function Page() {
                     <XAxis dataKey="jahr" tick={{ fill: "#71717a", fontSize: 11 }} axisLine={{ stroke: "#3f3f46" }} />
                     <YAxis tick={{ fill: "#71717a", fontSize: 11 }} axisLine={{ stroke: "#3f3f46" }} tickFormatter={v => `${Math.round(v / 1000)}k`} />
                     <Tooltip content={customTooltip} />
+                    {r.switchYears.map(y => (
+                      <ReferenceLine key={y} x={y} stroke="#f59e0b" strokeDasharray="4 4" strokeWidth={1.5} label={{ value: `Wechsel`, position: "top", style: { fill: "#f59e0b", fontSize: 9 } }} />
+                    ))}
                     <Area type="monotone" dataKey="fpBalance" name="Fondspolice" stroke="#10b981" fill="url(#gFp)" strokeWidth={2} />
                     <Area type="monotone" dataKey="trBalance" name="Trading Depot" stroke="#0ea5e9" fill="url(#gTr)" strokeWidth={2} />
                   </AreaChart>
@@ -269,8 +329,42 @@ export default function Page() {
                 <div className="flex gap-6 mt-3 justify-center">
                   <span className="flex items-center gap-2 text-xs text-zinc-400"><span className="w-3 h-3 rounded-full bg-emerald-500" /> Fondspolice</span>
                   <span className="flex items-center gap-2 text-xs text-zinc-400"><span className="w-3 h-3 rounded-full bg-sky-500" /> Trading Depot</span>
+                  {r.switchYears.length > 0 && <span className="flex items-center gap-2 text-xs text-zinc-400"><span className="w-3 h-0.5 bg-amber-500" /> Fondswechsel</span>}
                 </div>
               </div>
+
+              {/* Fund Switch Impact */}
+              {r.trSwitchEvents.length > 0 && (
+                <div className="bg-amber-950/20 rounded-xl border border-amber-800/30 p-5">
+                  <div className="flex items-start gap-3">
+                    <div className="w-10 h-10 rounded-lg bg-amber-900/50 flex items-center justify-center shrink-0">
+                      <svg className="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
+                    </div>
+                    <div className="flex-1">
+                      <h3 className="font-semibold text-amber-400">Fondswechsel-Kosten im Trading-Depot</h3>
+                      <p className="text-sm text-zinc-400 mt-1">
+                        Bei jedem Umschichten im Depot werden alle Kursgewinne realisiert und mit 26,375% KESt (nach 30% Teilfreistellung) versteuert. In der Fondspolice ist jeder Fondswechsel steuerneutral.
+                      </p>
+                      <div className="mt-3 space-y-2">
+                        {r.trSwitchEvents.map((ev, i) => (
+                          <div key={i} className="flex items-center gap-4 bg-zinc-900/60 rounded-lg px-3 py-2 text-xs flex-wrap">
+                            <span className="text-amber-400 font-semibold whitespace-nowrap">Jahr {ev.jahr}</span>
+                            <span className="text-zinc-400 whitespace-nowrap">Gewinn: <span className="text-zinc-200 font-mono">{fmtEur(ev.gewinn)}</span></span>
+                            <span className="text-zinc-400 whitespace-nowrap">Steuer: <span className="text-red-400 font-mono font-semibold">{fmtEur(ev.steuer)}</span></span>
+                            <span className="text-zinc-500 whitespace-nowrap">({fmtEur(ev.balanceVor)} → {fmtEur(ev.balanceNach)})</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-3 pt-3 border-t border-amber-900/30 flex justify-between items-center">
+                        <span className="text-sm text-zinc-300">Gesamter Steuerverlust durch Fondswechsel</span>
+                        <span className="text-lg font-bold font-mono text-red-400">{fmtEur(r.trFondswechselSteuerGesamt)}</span>
+                      </div>
+                      <p className="text-xs text-emerald-400 mt-2">In der Fondspolice: 0 € Steuer bei Fondswechsel</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-4">
                 <div className="bg-zinc-900/70 rounded-xl border border-emerald-800/30 p-5 space-y-3">
                   <div className="flex items-center gap-2 mb-3"><span className="w-2.5 h-2.5 rounded-full bg-emerald-500" /><h3 className="text-sm font-semibold text-emerald-400">Fondspolice / Privatrente</h3></div>
@@ -278,6 +372,7 @@ export default function Page() {
                   <MetricCard label="Kosten gesamt" value={fmtEur(r.fpTotalCosts)} sub="Abschluss + Verwaltung + Fonds" />
                   <MetricCard label="Steuer bei Auszahlung" value={fmtEur(r.fpSteuerAufwand)} sub="Halbeinkünfteverfahren (50% × pers. Satz)" />
                   <MetricCard label="Kapitalauszahlungskosten" value={fmtEur(r.fpKapitalauszahlungskosten)} sub="3,5% Auszahlungsgebühr" />
+                  {r.switchYears.length > 0 && <MetricCard label="Fondswechsel-Steuer" value="0 €" sub="Steuerfrei im Versicherungsmantel" accent />}
                   <MetricCard label="Netto verfügbar" value={fmtEur(r.fpNettoKapital)} accent />
                 </div>
                 <div className="bg-zinc-900/70 rounded-xl border border-sky-800/30 p-5 space-y-3">
@@ -285,7 +380,7 @@ export default function Page() {
                   <MetricCard label="Endkapital (brutto)" value={fmtEur(r.trBalance)} />
                   <MetricCard label="Vorabpauschale (kumuliert)" value={fmtEur(r.trVorabpauschaleGesamt)} sub="Jährliche Steuer auf Basisertrag" />
                   <MetricCard label="Steuer bei Verkauf" value={fmtEur(r.trSteuerAufwand)} sub="KESt 26,375% × 70% (Teilfreistellung)" />
-                  <div className="rounded-xl p-4 bg-zinc-800/20 border border-zinc-800/20" />
+                  {r.trFondswechselSteuerGesamt > 0 ? <MetricCard label="Fondswechsel-Steuer" value={fmtEur(r.trFondswechselSteuerGesamt)} sub={`${r.trSwitchEvents.length}× Umschichtung versteuert`} warn /> : <div className="rounded-xl p-4 bg-zinc-800/20 border border-zinc-800/20" />}
                   <MetricCard label="Netto verfügbar" value={fmtEur(r.trNetto)} />
                 </div>
               </div>
@@ -366,7 +461,7 @@ export default function Page() {
                 <div className="grid grid-cols-3 gap-4">
                   <MetricCard label="Monatlicher Beitrag" value={fmtEur(params.beitrag)} sub={`${r.monate / 12} Jahre × 12 Monate`} />
                   <MetricCard label="Gesamteinzahlung" value={fmtEur(r.beitragsSumme)} />
-                  <MetricCard label="Erwartete Rendite" value={`${Math.round(params.renditePa * 100)}% p.a.`} sub="vor Kosten" />
+                  <MetricCard label="Erwartete Rendite" value={`${Math.round(params.renditePa * 100)}% p.a.`} sub={r.switchYears.length > 0 ? `${r.switchYears.length} Fondswechsel` : "ohne Fondswechsel"} />
                 </div>
                 <div className="border-t border-zinc-800 pt-4 grid grid-cols-2 gap-6">
                   <div className="space-y-3">
@@ -376,6 +471,7 @@ export default function Page() {
                       <div className="flex justify-between"><span className="text-zinc-400">Netto nach Steuern</span><span className="font-mono text-emerald-400">{fmtEur(r.fpNettoKapital)}</span></div>
                       <div className="flex justify-between"><span className="text-zinc-400">Monatl. Rente (netto)</span><span className="font-mono text-emerald-400 font-semibold">{fmtEur(r.fpNettoRente)}</span></div>
                       <div className="flex justify-between"><span className="text-zinc-400">Dauer</span><span className="font-mono text-emerald-400">Lebenslang ∞</span></div>
+                      {r.switchYears.length > 0 && <div className="flex justify-between"><span className="text-zinc-400">Fondswechsel-Steuer</span><span className="font-mono text-emerald-400">0 €</span></div>}
                     </div>
                   </div>
                   <div className="space-y-3">
@@ -385,6 +481,7 @@ export default function Page() {
                       <div className="flex justify-between"><span className="text-zinc-400">Netto nach Steuern</span><span className="font-mono text-sky-400">{fmtEur(r.trNetto)}</span></div>
                       <div className="flex justify-between"><span className="text-zinc-400">Monatl. Entnahme (netto)</span><span className="font-mono text-sky-400 font-semibold">{fmtEur(r.trNettoEntnahmeMax)}</span></div>
                       <div className="flex justify-between"><span className="text-zinc-400">Reicht bis</span><span className={`font-mono ${r.trReichtAlter < params.lebenserwartung ? "text-red-400" : "text-sky-400"}`}>Alter {Math.round(r.trReichtAlter)}</span></div>
+                      {r.trFondswechselSteuerGesamt > 0 && <div className="flex justify-between"><span className="text-zinc-400">Fondswechsel-Steuer</span><span className="font-mono text-red-400">{fmtEur(r.trFondswechselSteuerGesamt)}</span></div>}
                     </div>
                   </div>
                 </div>
@@ -398,6 +495,7 @@ export default function Page() {
                     <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Keine laufende Vorabpauschale</li>
                     <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Günstige Ertragsanteilsbesteuerung</li>
                     <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Kein Langlebigkeitsrisiko</li>
+                    <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> <strong>Steuerfreie Fondswechsel</strong> im Mantel</li>
                   </ul>
                 </div>
                 <div className="bg-sky-950/20 rounded-xl border border-sky-800/20 p-5">
@@ -408,12 +506,16 @@ export default function Page() {
                     <li className="flex gap-2"><span className="text-sky-500 shrink-0">✓</span> Vererbbar (Restkapital)</li>
                     <li className="flex gap-2"><span className="text-sky-500 shrink-0">✓</span> Jederzeit verfügbar</li>
                     <li className="flex gap-2"><span className="text-sky-500 shrink-0">✓</span> 30% Teilfreistellung auf Aktien-ETFs</li>
+                    <li className="flex gap-2 text-zinc-500"><span className="text-red-500 shrink-0">✗</span> Fondswechsel löst Steuerzahlung aus</li>
                   </ul>
                 </div>
               </div>
               <div className="bg-gradient-to-br from-emerald-950/40 to-zinc-900/70 rounded-xl border border-emerald-800/30 p-6">
                 <h3 className="text-lg font-semibold text-emerald-400 mb-2">Kernaussage</h3>
-                <p className="text-zinc-300 leading-relaxed">Bei gleicher monatlicher Rente von <span className="font-semibold text-white">{fmtEur(r.fpNettoRente)} netto</span> reicht das Trading-Depot bis Alter <span className="font-semibold text-white">{Math.round(r.trReichtAlter)}</span>. Die Fondspolice zahlt dagegen <span className="font-semibold text-emerald-400">lebenslang</span> – egal ob du 85, 95 oder 105 wirst.</p>
+                <p className="text-zinc-300 leading-relaxed">
+                  Bei gleicher monatlicher Rente von <span className="font-semibold text-white">{fmtEur(r.fpNettoRente)} netto</span> reicht das Trading-Depot bis Alter <span className="font-semibold text-white">{Math.round(r.trReichtAlter)}</span>. Die Fondspolice zahlt dagegen <span className="font-semibold text-emerald-400">lebenslang</span>.
+                  {r.trFondswechselSteuerGesamt > 0 && <> Durch {r.trSwitchEvents.length} Fondswechsel gehen im Depot zusätzlich <span className="font-semibold text-red-400">{fmtEur(r.trFondswechselSteuerGesamt)}</span> an Steuern verloren – in der Fondspolice wären diese Umschichtungen komplett steuerfrei.</>}
+                </p>
                 <p className="text-sm text-zinc-500 mt-3">Hinweis: Vereinfachte Modellrechnung. Keine Anlageberatung.</p>
               </div>
             </>)}
