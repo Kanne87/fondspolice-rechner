@@ -1,0 +1,425 @@
+"use client";
+import { useState, useMemo, useCallback } from "react";
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine } from "recharts";
+
+// ─── Types ────────────────────────────────────────────────────────
+interface Params {
+  beitrag: number; alterHeute: number; rentenEintritt: number; renditePa: number;
+  basiszins: number; fondskostenPa: number; abschlusskostenPct: number;
+  verwaltungStart: number; verwaltungDecrease: number; persSteuersatz: number;
+  rentenfaktor: number; lebenserwartung: number; rentenRendite: number; ertragsanteil: number;
+}
+
+// ─── Calculation Engine ───────────────────────────────────────────
+function simulate(params: Params) {
+  const { beitrag, alterHeute, rentenEintritt, renditePa, basiszins, fondskostenPa, abschlusskostenPct, verwaltungStart, verwaltungDecrease, persSteuersatz, rentenfaktor, lebenserwartung, rentenRendite, ertragsanteil } = params;
+  const monate = (rentenEintritt - alterHeute) * 12;
+  const monthlyRate = renditePa / 12;
+  const monthlyFondsCost = fondskostenPa / 12;
+  const beitragsSumme = beitrag * monate;
+  const abschlussMonatlich = (beitragsSumme * abschlusskostenPct) / 60;
+  const kest = 0.26375;
+  const teilfreistellungETF = 0.30;
+  const rentenMonate = (lebenserwartung - rentenEintritt) * 12;
+  const rentenMonthlyRate = rentenRendite / 12;
+
+  let fpBalance = 0;
+  const fpData: {monat:number;jahr:number;fpBalance:number;trBalance:number}[] = [];
+  let fpTotalCosts = 0;
+
+  for (let m = 1; m <= monate; m++) {
+    const balanceStart = fpBalance + beitrag;
+    const fundCost = balanceStart * monthlyFondsCost;
+    const distCost = m <= 60 ? abschlussMonatlich : 0;
+    const yearIdx = Math.floor((m - 1) / 12);
+    const adminCost = Math.max(verwaltungStart - yearIdx * verwaltungDecrease, 0);
+    const netForGrowth = balanceStart - fundCost - distCost - adminCost;
+    const growth = netForGrowth * monthlyRate;
+    fpBalance = netForGrowth + growth;
+    fpTotalCosts += fundCost + distCost + adminCost;
+    if (m % 12 === 0 || m === monate) {
+      fpData.push({ monat: m, jahr: Math.round(m / 12), fpBalance: Math.round(fpBalance), trBalance: 0 });
+    }
+  }
+
+  let trBalance = 0;
+  let trVorabpauschaleGesamt = 0;
+  let trYearStartBalance = 0;
+  let trYearContributions = 0;
+
+  for (let m = 1; m <= monate; m++) {
+    if ((m - 1) % 12 === 0) { trYearStartBalance = trBalance; trYearContributions = 0; }
+    trYearContributions += beitrag;
+    const balanceStart = trBalance + beitrag;
+    const fundCost = balanceStart * monthlyFondsCost;
+    const netForGrowth = balanceStart - fundCost;
+    const growth = netForGrowth * monthlyRate;
+    trBalance = netForGrowth + growth;
+    if (m % 12 === 0) {
+      const basisertrag = trYearStartBalance * basiszins * 0.7;
+      const actualGain = trBalance - trYearStartBalance - trYearContributions;
+      const vorabBasis = Math.min(basisertrag, Math.max(0, actualGain));
+      const vorabSteuer = vorabBasis * (1 - teilfreistellungETF) * kest;
+      trVorabpauschaleGesamt += vorabSteuer;
+      trBalance -= vorabSteuer;
+    }
+    if (m % 12 === 0 || m === monate) {
+      const idx = fpData.findIndex(d => d.monat === m);
+      if (idx >= 0) fpData[idx].trBalance = Math.round(trBalance);
+    }
+  }
+
+  const trGewinn = trBalance - beitragsSumme;
+  const trSteuerpflichtig = trGewinn * (1 - teilfreistellungETF);
+  const trSteuerAufwand = trSteuerpflichtig * kest - trVorabpauschaleGesamt;
+  const trNetto = trBalance - Math.max(0, trSteuerAufwand);
+
+  const fpGewinn = fpBalance - beitragsSumme;
+  const fpKapitalauszahlungskosten = fpBalance * 0.035;
+  const fpSteuerpflichtig = fpGewinn * 0.5;
+  const fpSteuerAufwand = fpSteuerpflichtig * persSteuersatz;
+  const fpNettoKapital = fpBalance - fpKapitalauszahlungskosten - fpSteuerAufwand;
+
+  const fpMonatlicheRente = (fpBalance / 10000) * rentenfaktor;
+  const fpErtragsanteil = fpMonatlicheRente * ertragsanteil;
+  const fpRentenSteuer = fpErtragsanteil * persSteuersatz;
+  const fpNettoRente = fpMonatlicheRente - fpRentenSteuer;
+
+  const trGewinnAnteil = Math.max(0, (trNetto - beitragsSumme) / trNetto);
+  const zielNetto = fpNettoRente;
+  const zielBrutto = zielNetto / (1 - trGewinnAnteil * kest);
+
+  let trTempKapital = trNetto;
+  let trReichtMonate = 0;
+  const trRentenVerlauf: {jahr:number;alter:number;trKapital:number}[] = [];
+
+  for (let m = 1; m <= 600; m++) {
+    const wachstum = trTempKapital * rentenMonthlyRate;
+    trTempKapital = trTempKapital + wachstum - zielBrutto;
+    if (m % 12 === 0) {
+      trRentenVerlauf.push({ jahr: m / 12, alter: rentenEintritt + m / 12, trKapital: Math.max(0, Math.round(trTempKapital)) });
+    }
+    if (trTempKapital <= 0) { trReichtMonate = m; break; }
+  }
+  if (trTempKapital > 0) trReichtMonate = 600;
+
+  let trBruttoEntnahme: number;
+  if (rentenMonthlyRate > 0) {
+    trBruttoEntnahme = trNetto * rentenMonthlyRate / (1 - Math.pow(1 + rentenMonthlyRate, -rentenMonate));
+  } else {
+    trBruttoEntnahme = trNetto / rentenMonate;
+  }
+  const trEntnahmeSteuer = trBruttoEntnahme * trGewinnAnteil * kest;
+  const trNettoEntnahmeMax = trBruttoEntnahme - trEntnahmeSteuer;
+
+  return {
+    monate, beitragsSumme, fpBalance: Math.round(fpBalance), trBalance: Math.round(trBalance),
+    fpTotalCosts: Math.round(fpTotalCosts), trVorabpauschaleGesamt: Math.round(trVorabpauschaleGesamt),
+    trNetto: Math.round(trNetto), trSteuerAufwand: Math.round(Math.max(0, trSteuerAufwand)),
+    fpNettoKapital: Math.round(fpNettoKapital), fpSteuerAufwand: Math.round(fpSteuerAufwand),
+    fpKapitalauszahlungskosten: Math.round(fpKapitalauszahlungskosten),
+    fpMonatlicheRente: Math.round(fpMonatlicheRente), fpNettoRente: Math.round(fpNettoRente),
+    trNettoEntnahme: Math.round(zielNetto), trBruttoEntnahme: Math.round(zielBrutto),
+    trNettoEntnahmeMax: Math.round(trNettoEntnahmeMax),
+    trReichtMonate, trReichtJahre: Math.round(trReichtMonate / 12 * 10) / 10,
+    trReichtAlter: rentenEintritt + Math.round(trReichtMonate / 12 * 10) / 10,
+    ansparData: fpData, rentenVerlauf: trRentenVerlauf,
+  };
+}
+
+const fmt = (n: number) => new Intl.NumberFormat("de-DE", { maximumFractionDigits: 0 }).format(n);
+const fmtEur = (n: number) => fmt(n) + " €";
+
+function Slider({ label, value, onChange, min, max, step = 1, unit = "", helpText }: { label: string; value: number; onChange: (v: number) => void; min: number; max: number; step?: number; unit?: string; helpText?: string }) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex justify-between items-baseline">
+        <label className="text-sm text-zinc-400 font-medium">{label}</label>
+        <span className="text-sm font-mono text-emerald-400 font-semibold">{typeof value === "number" && value >= 1000 ? fmt(value) : value}{unit}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(parseFloat(e.target.value))} className="w-full h-1.5 rounded-full appearance-none cursor-pointer bg-zinc-700" />
+      {helpText && <p className="text-xs text-zinc-500">{helpText}</p>}
+    </div>
+  );
+}
+
+function MetricCard({ label, value, sub, accent = false, warn = false }: { label: string; value: string; sub?: string; accent?: boolean; warn?: boolean }) {
+  return (
+    <div className={`rounded-xl p-4 ${accent ? "bg-emerald-950/40 border border-emerald-800/30" : warn ? "bg-amber-950/30 border border-amber-800/30" : "bg-zinc-800/60 border border-zinc-700/30"}`}>
+      <p className="text-xs text-zinc-400 mb-1 uppercase tracking-wider">{label}</p>
+      <p className={`text-xl font-semibold font-mono ${accent ? "text-emerald-400" : warn ? "text-amber-400" : "text-zinc-100"}`}>{value}</p>
+      {sub && <p className="text-xs text-zinc-500 mt-1">{sub}</p>}
+    </div>
+  );
+}
+
+function CompareBar({ label, fpValue, trValue }: { label: string; fpValue: number; trValue: number }) {
+  const maxVal = Math.max(Math.abs(fpValue), Math.abs(trValue));
+  const fpW = maxVal > 0 ? (Math.abs(fpValue) / maxVal) * 100 : 0;
+  const trW = maxVal > 0 ? (Math.abs(trValue) / maxVal) * 100 : 0;
+  return (
+    <div className="space-y-1.5 py-2">
+      <p className="text-xs text-zinc-400">{label}</p>
+      <div className="space-y-1">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-emerald-400 w-20 shrink-0">Fondspolice</span>
+          <div className="flex-1 h-5 bg-zinc-800 rounded-md overflow-hidden">
+            <div className="h-full bg-emerald-600/60 rounded-md flex items-center px-2" style={{ width: `${Math.max(fpW, 8)}%` }}>
+              <span className="text-xs text-white font-mono whitespace-nowrap">{fmtEur(fpValue)}</span>
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-sky-400 w-20 shrink-0">Trading</span>
+          <div className="flex-1 h-5 bg-zinc-800 rounded-md overflow-hidden">
+            <div className="h-full bg-sky-600/60 rounded-md flex items-center px-2" style={{ width: `${Math.max(trW, 8)}%` }}>
+              <span className="text-xs text-white font-mono whitespace-nowrap">{fmtEur(trValue)}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const customTooltip = ({ active, payload, label }: any) => {
+  if (!active || !payload) return null;
+  return (
+    <div className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 shadow-xl text-xs">
+      <p className="text-zinc-400 mb-1">Jahr {label}</p>
+      {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+      {payload.map((p: any, i: number) => (<p key={i} style={{ color: p.color }} className="font-mono">{p.name}: {fmtEur(p.value)}</p>))}
+    </div>
+  );
+};
+
+export default function Page() {
+  const [params, setParams] = useState<Params>({
+    beitrag: 1000, alterHeute: 38, rentenEintritt: 67, renditePa: 0.09, basiszins: 0.032,
+    fondskostenPa: 0.002, abschlusskostenPct: 0.025, verwaltungStart: 123.17,
+    verwaltungDecrease: 2.796, persSteuersatz: 0.17, rentenfaktor: 26.18,
+    lebenserwartung: 88, rentenRendite: 0.02, ertragsanteil: 0.17,
+  });
+  const [activeTab, setActiveTab] = useState("anspar");
+  const set = useCallback((key: keyof Params, val: number) => setParams(p => ({ ...p, [key]: val })), []);
+  const r = useMemo(() => simulate(params), [params]);
+
+  const tabs = [{ id: "anspar", label: "Ansparphase" }, { id: "rente", label: "Rentenbezug" }, { id: "fazit", label: "Fazit" }];
+
+  return (
+    <div className="min-h-screen bg-zinc-950 text-zinc-100" style={{ fontFamily: "'DM Sans', system-ui, sans-serif" }}>
+      <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+      <div className="border-b border-zinc-800/80 bg-zinc-950/90 backdrop-blur-sm sticky top-0 z-20">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-emerald-600 flex items-center justify-center">
+              <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v12m-3-2.818l.879.659c1.171.879 3.07.879 4.242 0 1.172-.879 1.172-2.303 0-3.182C13.536 12.219 12.768 12 12 12c-.725 0-1.45-.22-2.003-.659-1.106-.879-1.106-2.303 0-3.182s2.9-.879 4.006 0l.415.33M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+            </div>
+            <div><h1 className="text-base font-semibold tracking-tight">Privatrente vs. Trading</h1><p className="text-xs text-zinc-500">Vergleichsrechner</p></div>
+          </div>
+          <div className="flex gap-1 bg-zinc-900 rounded-lg p-0.5">
+            {tabs.map(t => (<button key={t.id} onClick={() => setActiveTab(t.id)} className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${activeTab === t.id ? "bg-emerald-600 text-white shadow-lg shadow-emerald-900/30" : "text-zinc-400 hover:text-zinc-200"}`}>{t.label}</button>))}
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-6xl mx-auto px-4 py-6">
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+          <div className="lg:col-span-1">
+            <div className="bg-zinc-900/70 rounded-xl border border-zinc-800/60 p-4 space-y-4 sticky top-16">
+              <h3 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">Parameter</h3>
+              <Slider label="Monatlicher Beitrag" value={params.beitrag} onChange={v => set("beitrag", v)} min={100} max={3000} step={50} unit=" €" />
+              <Slider label="Aktuelles Alter" value={params.alterHeute} onChange={v => set("alterHeute", v)} min={20} max={55} unit=" Jahre" />
+              <Slider label="Renteneintritt" value={params.rentenEintritt} onChange={v => set("rentenEintritt", v)} min={60} max={70} unit=" Jahre" />
+              <Slider label="Erwartete Rendite" value={Math.round(params.renditePa * 100)} onChange={v => set("renditePa", v / 100)} min={3} max={12} step={0.5} unit="% p.a." />
+              <Slider label="Basiszins" value={Math.round(params.basiszins * 1000) / 10} onChange={v => set("basiszins", v / 100)} min={0} max={5} step={0.1} unit="%" helpText="Aktuell 3,2% (Stand 2025)" />
+              <div className="border-t border-zinc-800 pt-3">
+                <p className="text-xs text-zinc-500 mb-3">Erweitert</p>
+                <Slider label="Persönl. Steuersatz" value={Math.round(params.persSteuersatz * 100)} onChange={v => set("persSteuersatz", v / 100)} min={0} max={42} step={1} unit="%" />
+                <div className="mt-3"><Slider label="Rentenfaktor" value={params.rentenfaktor} onChange={v => set("rentenfaktor", v)} min={15} max={35} step={0.1} /></div>
+                <div className="mt-3"><Slider label="Lebenserwartung" value={params.lebenserwartung} onChange={v => set("lebenserwartung", v)} min={75} max={100} unit=" Jahre" /></div>
+              </div>
+              <div className="bg-zinc-800/50 rounded-lg p-3">
+                <p className="text-xs text-zinc-400"><span className="font-semibold text-zinc-300">{r.monate / 12} Jahre</span> Ansparzeit</p>
+                <p className="text-xs text-zinc-400 mt-1"><span className="font-semibold text-zinc-300">{fmtEur(r.beitragsSumme)}</span> Gesamteinzahlung</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="lg:col-span-3 space-y-6">
+            {activeTab === "anspar" && (<>
+              <div className="bg-zinc-900/70 rounded-xl border border-zinc-800/60 p-5">
+                <h2 className="text-lg font-semibold text-zinc-100 mb-1">Vermögenswachstum</h2>
+                <p className="text-sm text-zinc-500 mb-4">Kapitalentwicklung über die Ansparphase</p>
+                <ResponsiveContainer width="100%" height={320}>
+                  <AreaChart data={r.ansparData} margin={{ top: 10, right: 10, left: 10, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="gFp" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#10b981" stopOpacity={0.3} /><stop offset="100%" stopColor="#10b981" stopOpacity={0} /></linearGradient>
+                      <linearGradient id="gTr" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#0ea5e9" stopOpacity={0.3} /><stop offset="100%" stopColor="#0ea5e9" stopOpacity={0} /></linearGradient>
+                    </defs>
+                    <CartesianGrid stroke="#27272a" strokeDasharray="3 3" />
+                    <XAxis dataKey="jahr" tick={{ fill: "#71717a", fontSize: 11 }} axisLine={{ stroke: "#3f3f46" }} />
+                    <YAxis tick={{ fill: "#71717a", fontSize: 11 }} axisLine={{ stroke: "#3f3f46" }} tickFormatter={v => `${Math.round(v / 1000)}k`} />
+                    <Tooltip content={customTooltip} />
+                    <Area type="monotone" dataKey="fpBalance" name="Fondspolice" stroke="#10b981" fill="url(#gFp)" strokeWidth={2} />
+                    <Area type="monotone" dataKey="trBalance" name="Trading Depot" stroke="#0ea5e9" fill="url(#gTr)" strokeWidth={2} />
+                  </AreaChart>
+                </ResponsiveContainer>
+                <div className="flex gap-6 mt-3 justify-center">
+                  <span className="flex items-center gap-2 text-xs text-zinc-400"><span className="w-3 h-3 rounded-full bg-emerald-500" /> Fondspolice</span>
+                  <span className="flex items-center gap-2 text-xs text-zinc-400"><span className="w-3 h-3 rounded-full bg-sky-500" /> Trading Depot</span>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="bg-zinc-900/70 rounded-xl border border-emerald-800/30 p-5 space-y-3">
+                  <div className="flex items-center gap-2 mb-3"><span className="w-2.5 h-2.5 rounded-full bg-emerald-500" /><h3 className="text-sm font-semibold text-emerald-400">Fondspolice / Privatrente</h3></div>
+                  <MetricCard label="Endkapital (brutto)" value={fmtEur(r.fpBalance)} accent />
+                  <MetricCard label="Kosten gesamt" value={fmtEur(r.fpTotalCosts)} sub="Abschluss + Verwaltung + Fonds" />
+                  <MetricCard label="Steuer bei Auszahlung" value={fmtEur(r.fpSteuerAufwand)} sub="Halbeinkünfteverfahren (50% × pers. Satz)" />
+                  <MetricCard label="Kapitalauszahlungskosten" value={fmtEur(r.fpKapitalauszahlungskosten)} sub="3,5% Auszahlungsgebühr" />
+                  <MetricCard label="Netto verfügbar" value={fmtEur(r.fpNettoKapital)} accent />
+                </div>
+                <div className="bg-zinc-900/70 rounded-xl border border-sky-800/30 p-5 space-y-3">
+                  <div className="flex items-center gap-2 mb-3"><span className="w-2.5 h-2.5 rounded-full bg-sky-500" /><h3 className="text-sm font-semibold text-sky-400">Trading Depot (ETF)</h3></div>
+                  <MetricCard label="Endkapital (brutto)" value={fmtEur(r.trBalance)} />
+                  <MetricCard label="Vorabpauschale (kumuliert)" value={fmtEur(r.trVorabpauschaleGesamt)} sub="Jährliche Steuer auf Basisertrag" />
+                  <MetricCard label="Steuer bei Verkauf" value={fmtEur(r.trSteuerAufwand)} sub="KESt 26,375% × 70% (Teilfreistellung)" />
+                  <div className="rounded-xl p-4 bg-zinc-800/20 border border-zinc-800/20" />
+                  <MetricCard label="Netto verfügbar" value={fmtEur(r.trNetto)} />
+                </div>
+              </div>
+              <div className="bg-zinc-900/70 rounded-xl border border-zinc-800/60 p-5">
+                <h2 className="text-lg font-semibold text-zinc-100 mb-4">Direktvergleich bei Renteneintritt</h2>
+                <CompareBar label="Brutto-Endkapital" fpValue={r.fpBalance} trValue={r.trBalance} />
+                <CompareBar label="Netto nach Steuern & Kosten" fpValue={r.fpNettoKapital} trValue={r.trNetto} />
+              </div>
+            </>)}
+
+            {activeTab === "rente" && (<>
+              <div className="bg-zinc-900/70 rounded-xl border border-zinc-800/60 p-5">
+                <h2 className="text-lg font-semibold text-zinc-100 mb-1">Rentenbezugsphase</h2>
+                <p className="text-sm text-zinc-500 mb-4">Monatliches Einkommen ab Alter {params.rentenEintritt}</p>
+                <div className="grid grid-cols-2 gap-4 mb-6">
+                  <div className="bg-emerald-950/30 rounded-xl border border-emerald-800/20 p-4">
+                    <p className="text-xs text-emerald-400/70 uppercase tracking-wider mb-2">Fondspolice – Lebenslange Rente</p>
+                    <p className="text-3xl font-bold font-mono text-emerald-400">{fmtEur(r.fpNettoRente)}</p>
+                    <p className="text-xs text-zinc-500 mt-1">netto / Monat – garantiert lebenslang</p>
+                    <div className="mt-3 pt-3 border-t border-emerald-900/30 space-y-1">
+                      <p className="text-xs text-zinc-400">Brutto: {fmtEur(r.fpMonatlicheRente)}</p>
+                      <p className="text-xs text-zinc-400">Ertragsanteilsbesteuerung: {Math.round(params.ertragsanteil * 100)}%</p>
+                      <p className="text-xs text-zinc-400">Rentenfaktor: {params.rentenfaktor}</p>
+                    </div>
+                  </div>
+                  <div className="bg-sky-950/30 rounded-xl border border-sky-800/20 p-4">
+                    <p className="text-xs text-sky-400/70 uppercase tracking-wider mb-2">Trading – Entnahmeplan</p>
+                    <p className="text-3xl font-bold font-mono text-sky-400">{fmtEur(r.trNettoEntnahme)}</p>
+                    <p className="text-xs text-zinc-500 mt-1">netto / Monat – bis Kapital aufgebraucht</p>
+                    <div className="mt-3 pt-3 border-t border-sky-900/30 space-y-1">
+                      <p className="text-xs text-zinc-400">Brutto: {fmtEur(r.trBruttoEntnahme)}</p>
+                      <p className="text-xs text-zinc-400">Reicht bis Alter: <span className={r.trReichtAlter < params.lebenserwartung ? "text-red-400 font-semibold" : "text-emerald-400 font-semibold"}>{Math.round(r.trReichtAlter)}</span></p>
+                      <p className="text-xs text-zinc-400">Rendite in Rente: {Math.round(params.rentenRendite * 100)}% p.a.</p>
+                    </div>
+                  </div>
+                </div>
+                {r.rentenVerlauf.length > 0 && (
+                  <div className="mt-4">
+                    <p className="text-sm text-zinc-400 mb-3">Kapitalverlauf Trading-Depot bei gleicher Netto-Entnahme</p>
+                    <ResponsiveContainer width="100%" height={260}>
+                      <AreaChart data={r.rentenVerlauf} margin={{ top: 10, right: 10, left: 10, bottom: 0 }}>
+                        <defs><linearGradient id="gTrR" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#0ea5e9" stopOpacity={0.3} /><stop offset="100%" stopColor="#0ea5e9" stopOpacity={0} /></linearGradient></defs>
+                        <CartesianGrid stroke="#27272a" strokeDasharray="3 3" />
+                        <XAxis dataKey="alter" tick={{ fill: "#71717a", fontSize: 11 }} axisLine={{ stroke: "#3f3f46" }} />
+                        <YAxis tick={{ fill: "#71717a", fontSize: 11 }} axisLine={{ stroke: "#3f3f46" }} tickFormatter={v => `${Math.round(v / 1000)}k`} />
+                        <Tooltip content={({ active, payload }: {active?:boolean;payload?:{value:number;payload:{alter:number}}[]}) => {
+                          if (!active || !payload?.[0]) return null;
+                          return (<div className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 shadow-xl text-xs"><p className="text-zinc-400">Alter {payload[0].payload.alter}</p><p className="text-sky-400 font-mono">Restkapital: {fmtEur(payload[0].value)}</p></div>);
+                        }} />
+                        <ReferenceLine x={params.lebenserwartung} stroke="#ef4444" strokeDasharray="5 5" />
+                        <Area type="monotone" dataKey="trKapital" stroke="#0ea5e9" fill="url(#gTrR)" strokeWidth={2} />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+              </div>
+              <div className={`rounded-xl border p-5 ${r.trReichtAlter < params.lebenserwartung ? "bg-red-950/20 border-red-800/30" : "bg-emerald-950/20 border-emerald-800/30"}`}>
+                <div className="flex items-start gap-3">
+                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${r.trReichtAlter < params.lebenserwartung ? "bg-red-900/50" : "bg-emerald-900/50"}`}>
+                    <svg className={`w-5 h-5 ${r.trReichtAlter < params.lebenserwartung ? "text-red-400" : "text-emerald-400"}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      {r.trReichtAlter < params.lebenserwartung
+                        ? <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                        : <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />}
+                    </svg>
+                  </div>
+                  <div>
+                    <h3 className={`font-semibold ${r.trReichtAlter < params.lebenserwartung ? "text-red-400" : "text-emerald-400"}`}>{r.trReichtAlter < params.lebenserwartung ? "Langlebigkeitsrisiko vorhanden" : "Kapital reicht"}</h3>
+                    <p className="text-sm text-zinc-400 mt-1">{r.trReichtAlter < params.lebenserwartung ? `Bei gleicher Netto-Entnahme wie die Fondspolice (${fmtEur(r.fpNettoRente)}/Monat) ist das Trading-Kapital mit Alter ${Math.round(r.trReichtAlter)} aufgebraucht – ${Math.round(params.lebenserwartung - r.trReichtAlter)} Jahre vor der statistischen Lebenserwartung.` : `Das Trading-Kapital reicht bei dieser Entnahme bis Alter ${Math.round(r.trReichtAlter)}.`}</p>
+                    <p className="text-sm text-zinc-400 mt-2">Die Fondspolice zahlt <span className="text-emerald-400 font-semibold">lebenslang garantiert</span> – unabhängig davon, wie alt du wirst.</p>
+                  </div>
+                </div>
+              </div>
+            </>)}
+
+            {activeTab === "fazit" && (<>
+              <div className="bg-zinc-900/70 rounded-xl border border-zinc-800/60 p-6 space-y-6">
+                <h2 className="text-lg font-semibold text-zinc-100">Zusammenfassung</h2>
+                <div className="grid grid-cols-3 gap-4">
+                  <MetricCard label="Monatlicher Beitrag" value={fmtEur(params.beitrag)} sub={`${r.monate / 12} Jahre × 12 Monate`} />
+                  <MetricCard label="Gesamteinzahlung" value={fmtEur(r.beitragsSumme)} />
+                  <MetricCard label="Erwartete Rendite" value={`${Math.round(params.renditePa * 100)}% p.a.`} sub="vor Kosten" />
+                </div>
+                <div className="border-t border-zinc-800 pt-4 grid grid-cols-2 gap-6">
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-emerald-500" /><h3 className="text-sm font-semibold text-emerald-400">Fondspolice</h3></div>
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between"><span className="text-zinc-400">Endkapital</span><span className="font-mono text-zinc-200">{fmtEur(r.fpBalance)}</span></div>
+                      <div className="flex justify-between"><span className="text-zinc-400">Netto nach Steuern</span><span className="font-mono text-emerald-400">{fmtEur(r.fpNettoKapital)}</span></div>
+                      <div className="flex justify-between"><span className="text-zinc-400">Monatl. Rente (netto)</span><span className="font-mono text-emerald-400 font-semibold">{fmtEur(r.fpNettoRente)}</span></div>
+                      <div className="flex justify-between"><span className="text-zinc-400">Dauer</span><span className="font-mono text-emerald-400">Lebenslang ∞</span></div>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-sky-500" /><h3 className="text-sm font-semibold text-sky-400">Trading Depot</h3></div>
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between"><span className="text-zinc-400">Endkapital</span><span className="font-mono text-zinc-200">{fmtEur(r.trBalance)}</span></div>
+                      <div className="flex justify-between"><span className="text-zinc-400">Netto nach Steuern</span><span className="font-mono text-sky-400">{fmtEur(r.trNetto)}</span></div>
+                      <div className="flex justify-between"><span className="text-zinc-400">Monatl. Entnahme (netto)</span><span className="font-mono text-sky-400 font-semibold">{fmtEur(r.trNettoEntnahmeMax)}</span></div>
+                      <div className="flex justify-between"><span className="text-zinc-400">Reicht bis</span><span className={`font-mono ${r.trReichtAlter < params.lebenserwartung ? "text-red-400" : "text-sky-400"}`}>Alter {Math.round(r.trReichtAlter)}</span></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="bg-emerald-950/20 rounded-xl border border-emerald-800/20 p-5">
+                  <h3 className="text-sm font-semibold text-emerald-400 mb-3">Vorteile Fondspolice</h3>
+                  <ul className="space-y-2 text-sm text-zinc-300">
+                    <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Lebenslange garantierte Rente</li>
+                    <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Halbeinkünfteverfahren</li>
+                    <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Keine laufende Vorabpauschale</li>
+                    <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Günstige Ertragsanteilsbesteuerung</li>
+                    <li className="flex gap-2"><span className="text-emerald-500 shrink-0">✓</span> Kein Langlebigkeitsrisiko</li>
+                  </ul>
+                </div>
+                <div className="bg-sky-950/20 rounded-xl border border-sky-800/20 p-5">
+                  <h3 className="text-sm font-semibold text-sky-400 mb-3">Vorteile Trading Depot</h3>
+                  <ul className="space-y-2 text-sm text-zinc-300">
+                    <li className="flex gap-2"><span className="text-sky-500 shrink-0">✓</span> Volle Flexibilität bei Entnahme</li>
+                    <li className="flex gap-2"><span className="text-sky-500 shrink-0">✓</span> Keine Abschluss-/Verwaltungskosten</li>
+                    <li className="flex gap-2"><span className="text-sky-500 shrink-0">✓</span> Vererbbar (Restkapital)</li>
+                    <li className="flex gap-2"><span className="text-sky-500 shrink-0">✓</span> Jederzeit verfügbar</li>
+                    <li className="flex gap-2"><span className="text-sky-500 shrink-0">✓</span> 30% Teilfreistellung auf Aktien-ETFs</li>
+                  </ul>
+                </div>
+              </div>
+              <div className="bg-gradient-to-br from-emerald-950/40 to-zinc-900/70 rounded-xl border border-emerald-800/30 p-6">
+                <h3 className="text-lg font-semibold text-emerald-400 mb-2">Kernaussage</h3>
+                <p className="text-zinc-300 leading-relaxed">Bei gleicher monatlicher Rente von <span className="font-semibold text-white">{fmtEur(r.fpNettoRente)} netto</span> reicht das Trading-Depot bis Alter <span className="font-semibold text-white">{Math.round(r.trReichtAlter)}</span>. Die Fondspolice zahlt dagegen <span className="font-semibold text-emerald-400">lebenslang</span> – egal ob du 85, 95 oder 105 wirst.</p>
+                <p className="text-sm text-zinc-500 mt-3">Hinweis: Vereinfachte Modellrechnung. Keine Anlageberatung.</p>
+              </div>
+            </>)}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
