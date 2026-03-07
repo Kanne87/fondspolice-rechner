@@ -1,26 +1,32 @@
 import type { Metadata } from "next";
-import { cookies } from "next/headers";
+import { Playfair_Display, Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
+const playfair = Playfair_Display({
+  subsets: ["latin"],
+  weight: ["400", "600", "700"],
+  variable: "--font-playfair",
+});
+
+const geist = Geist({
+  subsets: ["latin"],
+  variable: "--font-geist",
+});
+
+const geistMono = Geist_Mono({
+  subsets: ["latin"],
+  variable: "--font-geist-mono",
+});
+
 export const metadata: Metadata = {
-  title: "Privatrente vs. Trading – Vergleichsrechner",
-  description: "HanseMerkur Vario Care Invest – Fondspolice und Trading-Depot im direkten Vergleich",
+  title: "Privatrente vs. Trading \u2013 Vergleichsrechner",
+  description: "HanseMerkur Vario Care Invest \u2013 Fondspolice und Trading-Depot im direkten Vergleich",
 };
 
-const PRESETS: Record<string, string> = {
-  cockpit: "",
-  premium: "theme-premium",
-  "dark-gold": "theme-dark-gold",
-};
-
-export default async function RootLayout({ children }: { children: React.ReactNode }) {
-  const cookieStore = await cookies();
-  const presetId = cookieStore.get("lo-design-preset")?.value ?? "premium";
-  const themeClass = PRESETS[presetId] ?? "theme-premium";
-
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="de" className={themeClass}>
-      <body className="antialiased">{children}</body>
+    <html lang="de" className={`${playfair.variable} ${geist.variable} ${geistMono.variable}`}>
+      <body className="font-[family-name:var(--font-geist)] antialiased">{children}</body>
     </html>
   );
 }
