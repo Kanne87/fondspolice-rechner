@@ -1,6 +1,62 @@
-import { signIn } from "@/auth";
+"use client"
+
+import { useState } from "react"
 
 export default function LoginPage() {
+  const [loading, setLoading] = useState(false)
+
+  const handleLogin = async () => {
+    setLoading(true)
+    try {
+      const res = await fetch("/api/auth/csrf")
+      const { csrfToken } = await res.json()
+
+      const popup = window.open("about:blank", "auth-popup", "width=500,height=700,scrollbars=yes,resizable=yes")
+      if (!popup) {
+        window.location.href = "/api/auth/signin/authentik"
+        return
+      }
+
+      const form = popup.document.createElement("form")
+      form.method = "POST"
+      form.action = "/api/auth/signin/authentik"
+
+      const csrf = popup.document.createElement("input")
+      csrf.type = "hidden"
+      csrf.name = "csrfToken"
+      csrf.value = csrfToken
+      form.appendChild(csrf)
+
+      const cb = popup.document.createElement("input")
+      cb.type = "hidden"
+      cb.name = "callbackUrl"
+      cb.value = window.location.origin + "/auth/success"
+      form.appendChild(cb)
+
+      popup.document.body.appendChild(form)
+      form.submit()
+
+      const onMessage = (e: MessageEvent) => {
+        if (e.origin === window.location.origin && e.data?.type === "auth-success") {
+          window.removeEventListener("message", onMessage)
+          popup.close()
+          window.location.href = "/"
+        }
+      }
+      window.addEventListener("message", onMessage)
+
+      const check = setInterval(() => {
+        if (popup.closed) {
+          clearInterval(check)
+          window.removeEventListener("message", onMessage)
+          setLoading(false)
+        }
+      }, 500)
+    } catch {
+      setLoading(false)
+    }
+  }
+
   return (
     <div className="min-h-screen flex items-center justify-center" style={{ background: "#f8f7f4" }}>
       <div className="w-full max-w-sm px-6">
@@ -12,25 +68,24 @@ export default function LoginPage() {
               </svg>
             </div>
             <div>
-              <div style={{ fontSize: "10px", color: "#9a7b2e", letterSpacing: "0.2em", textTransform: "uppercase", fontWeight: 500 }}>Konzeptvorsorge</div>
+              <div style={{ fontSize: "10px", color: "#9a7b2e", letterSpacing: "0.2em", textTransform: "uppercase" as const, fontWeight: 500 }}>Konzeptvorsorge</div>
               <h1 style={{ fontSize: "1.5rem", fontWeight: 700, color: "#1a1a2e", marginTop: "4px", fontFamily: "'Playfair Display', Georgia, serif" }}>
                 Privatrente vs. Trading
               </h1>
             </div>
-            <p style={{ fontSize: "12px", color: "#6a6a7a" }}>
-              Bitte anmelden um fortzufahren
-            </p>
+            <p style={{ fontSize: "12px", color: "#6a6a7a" }}>Bitte anmelden um fortzufahren</p>
           </div>
-          <form action={async () => { "use server"; await signIn("authentik", { redirectTo: "/" }); }}>
-            <button
-              type="submit"
-              style={{ width: "100%", height: "44px", borderRadius: "8px", background: "#9a7b2e", color: "#ffffff", fontSize: "14px", fontWeight: 500, border: "none", cursor: "pointer" }}
-            >
-              Login
-            </button>
-          </form>
+          <button
+            onClick={handleLogin}
+            disabled={loading}
+            className="w-full h-11 rounded-lg text-sm font-medium transition-colors cursor-pointer disabled:opacity-50"
+            style={{ background: "#9a7b2e", color: "#ffffff", border: "none" }}
+          >
+            {loading ? "Wird geladen..." : "Login"}
+          </button>
+          <p className="text-center" style={{ fontSize: "11px", color: "#9a9a9a" }}>Sichere Anmeldung über Authentik</p>
         </div>
       </div>
     </div>
-  );
+  )
 }
