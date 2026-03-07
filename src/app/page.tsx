@@ -1,6 +1,7 @@
 "use client";
 import { useState, useMemo, useCallback, useEffect } from "react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine } from "recharts";
+import { HISTORICAL_RETURNS, getReturnsForDuration } from "@/lib/historical-returns";
 
 // ─── Design Presets (matching lo-board) ────────────────────────────
 const PRESETS = [
@@ -174,6 +175,154 @@ function simulate(params: Params) {
 
 const fmt = (n: number) => new Intl.NumberFormat("de-DE", { maximumFractionDigits: 0 }).format(n);
 const fmtEur = (n: number) => fmt(n) + " €";
+const fmtPct = (n: number) => (n >= 0 ? "+" : "") + (n * 100).toFixed(1) + "%";
+
+// ─── Rebalancing-Simulation (historische Daten) ──────────────────
+interface RebalancingEvent {
+  jahr: number;
+  worldReturn: number;
+  emReturn: number;
+  istWorld: number;   // Ist-Gewichtung World vor Rebalancing
+  istEM: number;
+  umschichtung: number; // Betrag der umgeschichtet wird
+  gewinn: number;       // Realisierter Gewinn im Depot
+  steuer: number;       // Gezahlte Steuer im Depot
+  depotMitRebal: number;
+  policeMitRebal: number;
+}
+
+interface RebalancingResult {
+  events: RebalancingEvent[];
+  totalSteuer: number;
+  totalEntgangenerZinseszins: number;
+  depotEndwert: number;
+  policeEndwert: number;
+  vorteilPolice: number;
+}
+
+function simulateRebalancing(beitrag: number, monate: number): RebalancingResult {
+  const jahre = Math.floor(monate / 12);
+  const returns = getReturnsForDuration(jahre);
+  const kest = 0.26375;
+  const teilfreistellung = 0.30;
+  const targetWorld = 0.70;
+  const targetEM = 0.30;
+  const monthlyBeitrag = beitrag;
+  const yearlyBeitrag = monthlyBeitrag * 12;
+
+  // Depot: Zwei Fonds-Buckets mit separater Cost-Basis
+  let depotWorld = 0;
+  let depotEM = 0;
+  let cbWorld = 0; // Cost-Basis World
+  let cbEM = 0;    // Cost-Basis EM
+
+  // Police: Gleiche Struktur, aber steuerfrei
+  let policeWorld = 0;
+  let policeEM = 0;
+
+  const events: RebalancingEvent[] = [];
+
+  for (let j = 0; j < jahre; j++) {
+    const r = returns[j];
+
+    // Monatliche Beiträge 70/30 verteilen (vereinfacht: jährlich)
+    const beitragWorld = yearlyBeitrag * targetWorld;
+    const beitragEM = yearlyBeitrag * targetEM;
+
+    depotWorld += beitragWorld;
+    depotEM += beitragEM;
+    cbWorld += beitragWorld;
+    cbEM += beitragEM;
+    policeWorld += beitragWorld;
+    policeEM += beitragEM;
+
+    // Jahresrendite anwenden
+    depotWorld *= (1 + r.msciWorld);
+    depotEM *= (1 + r.msciEM);
+    policeWorld *= (1 + r.msciWorld);
+    policeEM *= (1 + r.msciEM);
+
+    const depotTotal = depotWorld + depotEM;
+    const policeTotal = policeWorld + policeEM;
+
+    // Ist-Gewichtung vor Rebalancing
+    const istWorld = depotTotal > 0 ? depotWorld / depotTotal : targetWorld;
+    const istEM = depotTotal > 0 ? depotEM / depotTotal : targetEM;
+
+    // Rebalancing: Ziel 70/30 wiederherstellen
+    const sollWorld = depotTotal * targetWorld;
+    const sollEM = depotTotal * targetEM;
+    const diffWorld = depotWorld - sollWorld; // positiv = übergewichtet
+
+    let steuer = 0;
+    let gewinn = 0;
+    const umschichtung = Math.abs(diffWorld);
+
+    if (Math.abs(diffWorld) > 1) { // Nur rebalancen wenn > 1€ Differenz
+      if (diffWorld > 0) {
+        // World übergewichtet → World verkaufen, EM kaufen
+        const sellRatio = diffWorld / depotWorld;
+        const sellCB = cbWorld * sellRatio;
+        gewinn = Math.max(0, diffWorld - sellCB);
+        steuer = gewinn * (1 - teilfreistellung) * kest;
+
+        // Depot aktualisieren
+        cbWorld -= sellCB;
+        depotWorld -= diffWorld;
+        depotWorld -= steuer; // Steuer wird dem Depot entnommen
+        cbEM += (diffWorld - steuer); // Zukauf EM
+        depotEM += (diffWorld - steuer);
+      } else {
+        // EM übergewichtet → EM verkaufen, World kaufen
+        const sellAmount = -diffWorld;
+        const sellRatio = sellAmount / depotEM;
+        const sellCB = cbEM * sellRatio;
+        gewinn = Math.max(0, sellAmount - sellCB);
+        steuer = gewinn * (1 - teilfreistellung) * kest;
+
+        cbEM -= sellCB;
+        depotEM -= sellAmount;
+        depotEM -= steuer;
+        cbWorld += (sellAmount - steuer);
+        depotWorld += (sellAmount - steuer);
+      }
+    }
+
+    // Police: steuerfrei rebalancen
+    const policeSollWorld = policeTotal * targetWorld;
+    const policeDiffWorld = policeWorld - policeSollWorld;
+    policeWorld -= policeDiffWorld;
+    policeEM += policeDiffWorld;
+
+    events.push({
+      jahr: j + 1,
+      worldReturn: r.msciWorld,
+      emReturn: r.msciEM,
+      istWorld,
+      istEM,
+      umschichtung: Math.round(umschichtung),
+      gewinn: Math.round(gewinn),
+      steuer: Math.round(steuer),
+      depotMitRebal: Math.round(depotWorld + depotEM),
+      policeMitRebal: Math.round(policeWorld + policeEM),
+    });
+  }
+
+  const depotEndwert = depotWorld + depotEM;
+  const policeEndwert = policeWorld + policeEM;
+  const totalSteuer = events.reduce((s, e) => s + e.steuer, 0);
+  const vorteilPolice = policeEndwert - depotEndwert;
+  const totalEntgangenerZinseszins = vorteilPolice - totalSteuer;
+
+  return {
+    events,
+    totalSteuer: Math.round(totalSteuer),
+    totalEntgangenerZinseszins: Math.round(Math.max(0, totalEntgangenerZinseszins)),
+    depotEndwert: Math.round(depotEndwert),
+    policeEndwert: Math.round(policeEndwert),
+    vorteilPolice: Math.round(vorteilPolice),
+  };
+}
 
 // ─── Themed Components ───────────────────────────────────────────
 function Slider({ label, value, onChange, min, max, step = 1, unit = "", helpText }: { label: string; value: number; onChange: (v: number) => void; min: number; max: number; step?: number; unit?: string; helpText?: string }) {
@@ -227,8 +376,11 @@ export default function Page() {
     fondswechselAnzahl: 2, fondswechselIntervall: 10, entnahmeDauer: 10,
   });
   const [activeTab, setActiveTab] = useState("anspar");
+  const [rebalancingEnabled, setRebalancingEnabled] = useState(false);
+  const [rebalancingOpen, setRebalancingOpen] = useState(false);
   const set = useCallback((key: keyof Params, val: number) => setParams(p => ({ ...p, [key]: val })), []);
   const r = useMemo(() => simulate(params), [params]);
+  const rebal = useMemo(() => rebalancingEnabled ? simulateRebalancing(params.beitrag, r.monate) : null, [rebalancingEnabled, params.beitrag, r.monate]);
   const tabs = [{ id: "anspar", label: "Ansparphase" }, { id: "rente", label: "Rentenbezug" }, { id: "fazit", label: "Fazit" }];
 
   // Theme-aware chart colors
@@ -289,6 +441,73 @@ export default function Page() {
                 )}
               </div>
 
+              {/* Rebalancing Toggle */}
+              <div style={{ borderTop: "1px solid var(--border)", paddingTop: "0.75rem" }}>
+                <div className="flex items-center justify-between mb-1">
+                  <div className="flex items-center gap-2">
+                    <span style={{ color: "var(--success)" }}>⚖</span>
+                    <p className="text-xs font-semibold" style={{ color: "var(--success)" }}>Rebalancing 70/30</p>
+                  </div>
+                  <button
+                    onClick={() => setRebalancingEnabled(!rebalancingEnabled)}
+                    className="relative w-9 h-5 rounded-full transition-colors"
+                    style={{ background: rebalancingEnabled ? "var(--success)" : "var(--border)" }}
+                  >
+                    <span className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full transition-transform" style={{ background: "var(--bg-card)", transform: rebalancingEnabled ? "translateX(16px)" : "translateX(0)" }} />
+                  </button>
+                </div>
+                <p className="text-xs mb-2" style={{ color: "var(--text-muted)", opacity: 0.7 }}>Jährliche Wiederherstellung der Zielgewichtung – in der Police steuerfrei</p>
+
+                {rebalancingEnabled && rebal && (
+                  <>
+                    <div className="rounded-lg p-2 mb-2" style={{ background: "var(--success-soft)" }}>
+                      <p className="text-xs" style={{ color: "var(--text-muted)" }}>Rebalancing-Steuer Depot: <span style={{ color: "var(--danger)", fontFamily: "var(--font-mono)", fontWeight: 600 }}>{fmtEur(rebal.totalSteuer)}</span></p>
+                      <p className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>Entgangener Zinseszins: <span style={{ color: "var(--danger)", fontFamily: "var(--font-mono)", fontWeight: 600 }}>{fmtEur(rebal.totalEntgangenerZinseszins)}</span></p>
+                      <p className="text-xs mt-1 pt-1" style={{ borderTop: "1px solid color-mix(in srgb, var(--border) 50%, transparent)", color: "var(--text-muted)" }}>Vorteil Fondspolice: <span style={{ color: "var(--success)", fontFamily: "var(--font-mono)", fontWeight: 600 }}>{fmtEur(rebal.vorteilPolice)}</span></p>
+                    </div>
+                    <button
+                      onClick={() => setRebalancingOpen(!rebalancingOpen)}
+                      className="flex items-center gap-1 text-xs w-full"
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      <span style={{ fontSize: 10, transition: "transform 0.2s", transform: rebalancingOpen ? "rotate(90deg)" : "rotate(0)" }}>▶</span>
+                      <span>{rebalancingOpen ? "Details ausblenden" : "Details anzeigen"}</span>
+                    </button>
+                    {rebalancingOpen && (
+                      <div className="mt-2 overflow-x-auto">
+                        <p className="text-xs mb-2" style={{ color: "var(--text-muted)" }}>Historische Renditen MSCI World / EM (EUR Net) – {HISTORICAL_RETURNS.length} Jahre Datenbasis</p>
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr style={{ borderBottom: "1px solid var(--border)" }}>
+                              <th className="py-1 pr-1 text-left font-medium" style={{ color: "var(--text-muted)" }}>J.</th>
+                              <th className="py-1 pr-1 text-right font-medium" style={{ color: "var(--text-muted)" }}>World</th>
+                              <th className="py-1 pr-1 text-right font-medium" style={{ color: "var(--text-muted)" }}>EM</th>
+                              <th className="py-1 pr-1 text-right font-medium" style={{ color: "var(--text-muted)" }}>Steuer</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {rebal.events.map((ev, i) => (
+                              <tr key={i} style={{ borderBottom: "1px solid color-mix(in srgb, var(--border) 30%, transparent)" }}>
+                                <td className="py-0.5 pr-1" style={{ color: "var(--text-muted)" }}>{ev.jahr}</td>
+                                <td className="py-0.5 pr-1 text-right" style={{ fontFamily: "var(--font-mono)", color: ev.worldReturn >= 0 ? "var(--success)" : "var(--danger)" }}>{fmtPct(ev.worldReturn)}</td>
+                                <td className="py-0.5 pr-1 text-right" style={{ fontFamily: "var(--font-mono)", color: ev.emReturn >= 0 ? "var(--success)" : "var(--danger)" }}>{fmtPct(ev.emReturn)}</td>
+                                <td className="py-0.5 text-right" style={{ fontFamily: "var(--font-mono)", color: ev.steuer > 0 ? "var(--danger)" : "var(--text-muted)" }}>{ev.steuer > 0 ? fmtEur(ev.steuer) : "–"}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                          <tfoot>
+                            <tr style={{ borderTop: "1px solid var(--border)" }}>
+                              <td colSpan={3} className="py-1 font-semibold text-xs">Summe Steuer</td>
+                              <td className="py-1 text-right font-semibold" style={{ color: "var(--danger)", fontFamily: "var(--font-mono)" }}>{fmtEur(rebal.totalSteuer)}</td>
+                            </tr>
+                          </tfoot>
+                        </table>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
               <div style={{ borderTop: "1px solid var(--border)", paddingTop: "0.75rem" }}>
                 <p className="text-xs mb-3" style={{ color: "var(--text-muted)" }}>Erweitert</p>
                 <Slider label="Persönl. Steuersatz" value={Math.round(params.persSteuersatz*100)} onChange={v => set("persSteuersatz", v/100)} min={0} max={42} step={1} unit="%" />
@@ -342,6 +561,29 @@ export default function Page() {
                     <span className="text-lg font-bold" style={{color:"var(--danger)",fontFamily:"var(--font-mono)"}}>{fmtEur(r.trFondswechselSteuerGesamt)}</span>
                   </div>
                   <p className="text-xs mt-2" style={{color:"var(--success)"}}>In der Fondspolice: 0 € Steuer bei Fondswechsel</p>
+                </div></div></Card>
+              )}
+
+              {rebalancingEnabled && rebal && (
+                <Card accent><div className="flex items-start gap-3"><div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{background:"var(--success-soft)"}}><span style={{color:"var(--success)",fontSize:18}}>⚖</span></div><div className="flex-1">
+                  <h3 className="font-semibold" style={{color:"var(--success)"}}>Rebalancing-Vorteil Fondspolice</h3>
+                  <p className="text-sm mt-1" style={{color:"var(--text-muted)"}}>Jährliche Wiederherstellung der 70/30-Gewichtung (MSCI World / EM). Im Depot löst jedes Rebalancing Kapitalertragssteuer aus – in der Fondspolice steuerfrei.</p>
+                  <div className="grid grid-cols-3 gap-3 mt-3">
+                    <div className="rounded-lg p-2 text-center" style={{background:"var(--bg)"}}>
+                      <p className="text-xs" style={{color:"var(--text-muted)"}}>Steuer (direkt)</p>
+                      <p className="text-sm font-bold" style={{color:"var(--danger)",fontFamily:"var(--font-mono)"}}>{fmtEur(rebal.totalSteuer)}</p>
+                    </div>
+                    <div className="rounded-lg p-2 text-center" style={{background:"var(--bg)"}}>
+                      <p className="text-xs" style={{color:"var(--text-muted)"}}>Entg. Zinseszins</p>
+                      <p className="text-sm font-bold" style={{color:"var(--danger)",fontFamily:"var(--font-mono)"}}>{fmtEur(rebal.totalEntgangenerZinseszins)}</p>
+                    </div>
+                    <div className="rounded-lg p-2 text-center" style={{background:"var(--success-soft)"}}>
+                      <p className="text-xs" style={{color:"var(--text-muted)"}}>Vorteil Police</p>
+                      <p className="text-sm font-bold" style={{color:"var(--success)",fontFamily:"var(--font-mono)"}}>{fmtEur(rebal.vorteilPolice)}</p>
+                    </div>
+                  </div>
+                  <p className="text-xs mt-3" style={{color:"var(--text-muted)"}}>Basierend auf {Math.min(Math.floor(r.monate/12), HISTORICAL_RETURNS.length)} Jahren historischer MSCI-Daten (EUR Net Return). Gewichtung: 70% MSCI World, 30% MSCI Emerging Markets.</p>
+                  <p className="text-xs mt-2" style={{color:"var(--success)"}}>In der Fondspolice: 0 € Steuer bei Rebalancing – Allokation wird jährlich automatisch steuerfrei wiederhergestellt.</p>
                 </div></div></Card>
               )}
 
@@ -452,18 +694,19 @@ export default function Page() {
                       <div className="flex justify-between"><span style={{color:"var(--text-muted)"}}>Monatl. Entnahme</span><span className="font-semibold" style={{color:"var(--sky)",fontFamily:"var(--font-mono)"}}>{fmtEur(r.trNettoEntnahmeMax)}</span></div>
                       <div className="flex justify-between"><span style={{color:"var(--text-muted)"}}>Reicht bis</span><span style={{color:r.trReichtAlter<params.lebenserwartung?"var(--danger)":"var(--sky)",fontFamily:"var(--font-mono)"}}>Alter {Math.round(r.trReichtAlter)}</span></div>
                       {r.trFondswechselSteuerGesamt>0&&<div className="flex justify-between"><span style={{color:"var(--text-muted)"}}>Fondswechsel-Steuer</span><span style={{color:"var(--danger)",fontFamily:"var(--font-mono)"}}>{fmtEur(r.trFondswechselSteuerGesamt)}</span></div>}
+                      {rebal&&<div className="flex justify-between"><span style={{color:"var(--text-muted)"}}>Rebalancing-Steuer</span><span style={{color:"var(--danger)",fontFamily:"var(--font-mono)"}}>{fmtEur(rebal.totalSteuer)}</span></div>}
                     </div>
                   </div>
                 </div>
               </Card>
 
               <div className="grid grid-cols-2 gap-4">
-                <Card accent><h3 className="text-sm font-semibold mb-3" style={{color:"var(--accent)",fontFamily:"var(--font-heading)"}}>Vorteile Fondspolice</h3><ul className="space-y-2 text-sm">{["Lebenslange garantierte Rente","Halbeinkünfteverfahren","Keine laufende Vorabpauschale","Günstige Ertragsanteilsbesteuerung","Kein Langlebigkeitsrisiko","Steuerfreie Fondswechsel im Mantel","Kapitalentnahme mit Halbeinkünfteverfahren"].map((t,i)=>(<li key={i} className="flex gap-2"><span style={{color:"var(--success)"}}>✓</span>{t}</li>))}</ul></Card>
-                <Card style={{borderColor:"var(--sky)"}}><h3 className="text-sm font-semibold mb-3" style={{color:"var(--sky)",fontFamily:"var(--font-heading)"}}>Vorteile Trading Depot</h3><ul className="space-y-2 text-sm">{["Volle Flexibilität bei Entnahme","Keine Abschluss-/Verwaltungskosten","Vererbbar (Restkapital)","Jederzeit verfügbar","30% Teilfreistellung auf Aktien-ETFs"].map((t,i)=>(<li key={i} className="flex gap-2"><span style={{color:"var(--sky)"}}>✓</span>{t}</li>))}<li className="flex gap-2" style={{color:"var(--text-muted)"}}><span style={{color:"var(--danger)"}}>✗</span>Fondswechsel löst Steuer aus</li></ul></Card>
+                <Card accent><h3 className="text-sm font-semibold mb-3" style={{color:"var(--accent)",fontFamily:"var(--font-heading)"}}>Vorteile Fondspolice</h3><ul className="space-y-2 text-sm">{["Lebenslange garantierte Rente","Halbeinkünfteverfahren","Keine laufende Vorabpauschale","Günstige Ertragsanteilsbesteuerung","Kein Langlebigkeitsrisiko","Steuerfreie Fondswechsel im Mantel","Steuerfreies Rebalancing (70/30)","Kapitalentnahme mit Halbeinkünfteverfahren"].map((t,i)=>(<li key={i} className="flex gap-2"><span style={{color:"var(--success)"}}>✓</span>{t}</li>))}</ul></Card>
+                <Card style={{borderColor:"var(--sky)"}}><h3 className="text-sm font-semibold mb-3" style={{color:"var(--sky)",fontFamily:"var(--font-heading)"}}>Vorteile Trading Depot</h3><ul className="space-y-2 text-sm">{["Volle Flexibilität bei Entnahme","Keine Abschluss-/Verwaltungskosten","Vererbbar (Restkapital)","Jederzeit verfügbar","30% Teilfreistellung auf Aktien-ETFs"].map((t,i)=>(<li key={i} className="flex gap-2"><span style={{color:"var(--sky)"}}>✓</span>{t}</li>))}<li className="flex gap-2" style={{color:"var(--text-muted)"}}><span style={{color:"var(--danger)"}}>✗</span>Fondswechsel löst Steuer aus</li><li className="flex gap-2" style={{color:"var(--text-muted)"}}><span style={{color:"var(--danger)"}}>✗</span>Rebalancing löst Steuer aus</li></ul></Card>
               </div>
 
               <Card accent><h3 className="text-lg font-semibold mb-2" style={{color:"var(--accent)",fontFamily:"var(--font-heading)"}}>Kernaussage</h3>
-                <p style={{color:"var(--text)",lineHeight:1.7}}>Bei gleicher monatlicher Rente von <strong>{fmtEur(r.fpNettoRente)} netto</strong> reicht das Trading-Depot bis Alter <strong>{Math.round(r.trReichtAlter)}</strong>. Die Fondspolice zahlt dagegen <strong style={{color:"var(--success)"}}>lebenslang</strong>.{r.trFondswechselSteuerGesamt>0&&<> Durch {r.trSwitchEvents.length} Fondswechsel gehen im Depot zusätzlich <strong style={{color:"var(--danger)"}}>{fmtEur(r.trFondswechselSteuerGesamt)}</strong> an Steuern verloren – in der Fondspolice steuerfrei.</>}</p>
+                <p style={{color:"var(--text)",lineHeight:1.7}}>Bei gleicher monatlicher Rente von <strong>{fmtEur(r.fpNettoRente)} netto</strong> reicht das Trading-Depot bis Alter <strong>{Math.round(r.trReichtAlter)}</strong>. Die Fondspolice zahlt dagegen <strong style={{color:"var(--success)"}}>lebenslang</strong>.{r.trFondswechselSteuerGesamt>0&&<> Durch {r.trSwitchEvents.length} Fondswechsel gehen im Depot zusätzlich <strong style={{color:"var(--danger)"}}>{fmtEur(r.trFondswechselSteuerGesamt)}</strong> an Steuern verloren.</>}{rebal&&rebal.vorteilPolice>0&&<> Durch jährliches Rebalancing entsteht ein weiterer Steuerverlust von <strong style={{color:"var(--danger)"}}>{fmtEur(rebal.totalSteuer)}</strong> plus <strong style={{color:"var(--danger)"}}>{fmtEur(rebal.totalEntgangenerZinseszins)}</strong> entgangenem Zinseszins.</>} {(r.trFondswechselSteuerGesamt>0||(rebal&&rebal.vorteilPolice>0))&&<>In der Fondspolice <strong style={{color:"var(--success)"}}>steuerfrei</strong>.</>}</p>
                 <p className="text-sm mt-3" style={{color:"var(--text-muted)"}}>Hinweis: Vereinfachte Modellrechnung. Keine Anlageberatung.</p>
               </Card>
             </>)}
